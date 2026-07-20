@@ -1,0 +1,13 @@
+[icsdatahub-prd]
+account = "icsdatahub-prd"
+user = "IamBatman@SUFFOLK.GOV.UK"
+authenticator = "externalbrowser"
+role = "SCC_ANALYST"
+warehouse = "WH__XSMALL"
+
+[icsdatahub-dev]
+account = "icsdatahub-dev"
+user = "IamBatman@SUFFOLK.GOV.UK"
+authenticator = "externalbrowser"
+role = "SCC_ANALYST"
+warehouse = "WH__XSMALL"
