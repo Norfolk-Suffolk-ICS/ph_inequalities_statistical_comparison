@@ -1,6 +1,6 @@
 ## Overview
 
-This module provides four functions for summarising binary/count outcomes across groups (e.g. alliances, ICBs, core20 areas), each returning a per-group estimate alongside a confidence interval and a simple flag showing whether that group differs from the population as a whole.
+This module provides four functions for summarising binary/count outcomes across groups (e.g. core20, plus, alliances, PCNs, etc), each returning a per-group estimate alongside a confidence interval and a flag showing whether that group differs from the population as a whole.
 
 | Function | Measure | Use when |
 |---|---|---|
@@ -28,7 +28,7 @@ Every function expects **row-level tabular data** in a Polars DataFrame — not 
 
 ### Group columns
 
-`group_cols` define what you're comparing (e.g. alliance, ICB). One output row is produced per unique combination of `group_cols`, plus the Overall row. For `crude_proportion_df` and `crude_rate_df`, `group_cols` is optional — if omitted, the function returns a single row summarising the whole dataset with no group comparison. For the two standardised functions, `group_cols` is required.
+`group_cols` define what you're comparing (e.g. core20, alliance). One output row is produced per unique combination of `group_cols`, plus the Overall row. For `crude_proportion_df` and `crude_rate_df`, `group_cols` is optional — if omitted, the function returns a single row summarising the whole dataset with no group comparison. For the two standardised functions, `group_cols` is required.
 
 ### Nulls and types (strictly enforced)
 
