@@ -15,4 +15,5 @@ Helper functions are prefixed with an `_`. Public functions (that the user shoul
 - User guide: [ph-inequalities-statistical-comparison-guide.md](./ph-inequalities-statistical-comparison-guide.md)
 - python module: [ph_inequalities_statistical_comparison.py](./ph_inequalities_statistical_comparison.py)
 - test suite for the module: [test_ph_inequalities_statistical_comparison.py](./test_ph_inequalities_statistical_comparison.py)
+- details of statistical approach: [statistical-documentation.py](./statistical-documentation.py)
 - snowflake integration issues: [further-issues.md](./further-issues.md)
