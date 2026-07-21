@@ -31,9 +31,16 @@ Public API
 - directly_standardized_rate_df       : DSR per group with Dobson-Byar CI
 
 All four functions append an "Overall" row summarising the full input
-dataset, and (when group_cols are supplied) test every non-Overall row
-against that Overall/reference value, adaptively selecting the appropriate
-statistical test and multiple-testing correction based on group sparsity.
+dataset. When group_cols are supplied, every non-Overall row's confidence
+interval is checked against the Overall/reference value: the reference
+value is treated as a FIXED benchmark (not a random variable with its own
+sampling error), and a group is flagged "Higher" or "Lower" whenever that
+fixed reference value falls entirely outside the group's own confidence
+interval. No formal hypothesis test (no p-values, no multiple-testing
+correction) is performed -- significance is assessed purely via
+confidence-interval overlap against the fixed reference, consistent with
+the simplified approach commonly used in UKHSA/OHID public-facing
+dashboards (e.g. Fingertips).
 
 CI method summary
 ------------------
@@ -46,21 +53,14 @@ CI method summary
 | DSR                | Haldane (sparse)  | PHE Dobson-Byar                  |
 +--------------------+-------------------+----------------------------------+
 
-Significance testing summary
------------------------------
-+---------------------+---------------------------+---------------------------+
-| Measure             | Dense-group test          | Sparse-group test         |
-+---------------------+---------------------------+---------------------------+
-| Crude proportion    | Two-proportion z-test     | Fisher exact              |
-| Crude rate          | Poisson z-test (SMR-style)| Mid-P exact Poisson       |
-| DSP                 | Dobson z-test vs reference| Exact one-sample binomial |
-| DSR                 | Dobson z-test vs reference| Exact one-sample mid-P    |
-+---------------------+---------------------------+---------------------------+
-Multiple testing correction: Benjamini-Hochberg (FDR) if any group in the
-batch is sparse, otherwise a Holm-Sidak step-down correction (an
-assumption-light approximation to Dunnett's many-to-one comparison-to-
-reference procedure; labelled "Holm-Sidak" in the test_method / notes,
-since it is not the exact classical Dunnett test).
+Significance assessment
+------------------------
+For every non-Overall row, the Overall/reference value is compared against
+that row's own confidence interval bounds:
+  - reference < lower  -> "Higher" (group's estimate exceeds the reference)
+  - reference > upper  -> "Lower"  (group's estimate is below the reference)
+  - otherwise          -> "Not significant" (reference falls within the CI)
+The Overall row itself is always labelled "Reference".
 
 References
 ----------
@@ -247,10 +247,10 @@ def _filter_group(df: pl.DataFrame, row: dict) -> pl.DataFrame:
 # Wilson score CI (crude proportion)
 # ===========================================================================
 
-def _wilson_proportion_ci(events: float, n: float, confidence: float = 0.95) -> tuple[float, float, float, float]:
-    """Wilson score CI for a single proportion. Returns (lower, upper, variance, std_dev)."""
+def _wilson_proportion_ci(events: float, n: float, confidence: float = 0.95) -> tuple[float, float, float]:
+    """Wilson score CI for a single proportion. Returns (lower, upper, variance)."""
     if n == 0:
-        return np.nan, np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan
     p = events / n
     z = stats.norm.ppf(1 - (1 - confidence) / 2)
     denom = 1 + (z ** 2) / n
@@ -259,8 +259,7 @@ def _wilson_proportion_ci(events: float, n: float, confidence: float = 0.95) -> 
     lower = max(0.0, center - half_width)
     upper = min(1.0, center + half_width)
     variance = p * (1 - p) / n
-    std_dev = float(np.sqrt(variance)) if variance >= 0 else np.nan
-    return float(lower), float(upper), float(variance), std_dev
+    return float(lower), float(upper), float(variance)
 
 
 # ===========================================================================
@@ -306,13 +305,13 @@ def _wilson_dobson_proportion_ci(
     dsp: float, crude_events: float, crude_n: float,
     stratum_weights: np.ndarray, stratum_props: np.ndarray, stratum_ns: np.ndarray,
     confidence: float = 0.95,
-) -> tuple[float, float, float, float, float]:
+) -> tuple[float, float, float]:
     """
     PHE Wilson-Dobson CI for a directly standardised proportion.
-    Returns (lower, upper, scale, variance, std_dev).
+    Returns (lower, upper, variance).
     """
     if crude_n <= 0 or not np.isfinite(dsp):
-        return np.nan, np.nan, np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan
 
     valid = stratum_ns > 0
     w = stratum_weights[valid]
@@ -320,21 +319,20 @@ def _wilson_dobson_proportion_ci(
     n = stratum_ns[valid]
     w_sum = float(np.sum(stratum_weights))
     if w_sum == 0 or len(w) == 0:
-        return np.nan, np.nan, np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan
 
     var_dsp = float(np.sum((w ** 2) * p * (1 - p) / n) / (w_sum ** 2))
-    std_dev = float(np.sqrt(var_dsp)) if var_dsp >= 0 else np.nan
 
     crude_p = crude_events / crude_n
-    p_lo, p_hi, var_crude, _ = _wilson_proportion_ci(crude_events, crude_n, confidence)
+    p_lo, p_hi, var_crude = _wilson_proportion_ci(crude_events, crude_n, confidence)
 
     if var_crude == 0 or not np.isfinite(var_crude):
-        return float(dsp), float(dsp), 0.0, var_dsp, std_dev
+        return float(dsp), float(dsp), var_dsp
 
     scale = float(np.sqrt(var_dsp / var_crude))
     lower = dsp + scale * (p_lo - crude_p)
     upper = dsp + scale * (p_hi - crude_p)
-    return float(max(lower, 0.0)), float(min(upper, 1.0)), scale, var_dsp, std_dev
+    return float(max(lower, 0.0)), float(min(upper, 1.0)), var_dsp
 
 
 def _compute_proportion_stratum_stats(
@@ -397,13 +395,13 @@ def _dobson_byar_rate_ci(
     dsr_unscaled: float, crude_events: float,
     stratum_weights: np.ndarray, stratum_events: np.ndarray, stratum_denoms: np.ndarray,
     confidence: float = 0.95,
-) -> tuple[float, float, float, float, float]:
+) -> tuple[float, float, float]:
     """
     PHE Dobson-Byar CI for a directly standardised rate (unscaled).
-    Returns (lower, upper, scale, variance, std_dev).
+    Returns (lower, upper, variance).
     """
     if crude_events < 0:
-        return np.nan, np.nan, np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan
 
     if crude_events < 10:
         O_lo, O_hi = _exact_poisson_count_ci(crude_events, confidence)
@@ -416,19 +414,18 @@ def _dobson_byar_rate_ci(
     ni = stratum_denoms[valid]
     w_sum = float(np.sum(stratum_weights))
     if w_sum == 0 or len(w) == 0:
-        return np.nan, np.nan, np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan
 
     var_dsr = float(np.sum((w ** 2) * Oi / (ni ** 2)) / (w_sum ** 2))
-    std_dev = float(np.sqrt(var_dsr)) if var_dsr >= 0 else np.nan
     var_O = float(crude_events)
 
     if var_O == 0.0 or var_dsr == 0.0:
-        return float(dsr_unscaled), float(dsr_unscaled), 0.0, var_dsr, std_dev
+        return float(dsr_unscaled), float(dsr_unscaled), var_dsr
 
     scale = float(np.sqrt(var_dsr / var_O))
     lower = dsr_unscaled + scale * (O_lo - crude_events)
     upper = dsr_unscaled + scale * (O_hi - crude_events)
-    return float(max(lower, 0.0)), float(max(upper, 0.0)), scale, var_dsr, std_dev
+    return float(max(lower, 0.0)), float(max(upper, 0.0)), var_dsr
 
 
 def _compute_rate_stratum_stats(
@@ -521,237 +518,29 @@ def _crude_rate_notes(events: float, denominator: float, end_of_period_denom: bo
 
 
 # ===========================================================================
-# Significance testing vs the overall/population reference
+# Significance assessment vs the overall/population reference
 # ===========================================================================
+#
+# The Overall/reference value is treated as a FIXED benchmark (not a random
+# variable). No formal hypothesis test is performed: a group's estimate is
+# simply classified according to whether the fixed reference value falls
+# inside or outside that group's own confidence interval.
 
-def _select_proportion_test(events: float, n: float) -> str:
+def _significance_from_ci(reference: float, lower: float, upper: float) -> str:
     """
-    Choose the appropriate test for comparing a group proportion against the
-    overall population proportion.
-
-    Fisher's exact test is used whenever either cell count is small
-    (events < 10 or non-events < 10), matching the sparsity threshold used
-    elsewhere in this module.  Otherwise a two-proportion z-test is used.
-    """
-    if n == 0 or events > n:
-        return "undefined"
-    non_events = n - events
-    if events < 10 or non_events < 10:
-        return "Fisher exact"
-    return "Two-proportion z-test"
-
-
-def _test_proportion_vs_overall(
-    events: float, n: float, overall_events: float, overall_n: float
-) -> tuple[float, str]:
-    """Test a group's proportion against the overall/population proportion."""
-    method = _select_proportion_test(events, n)
-    if method == "undefined" or overall_n == 0:
-        return np.nan, method
-
-    if method == "Fisher exact":
-        group_non_events = n - events
-        rest_events = max(overall_events - events, 0.0)
-        rest_non_events = max((overall_n - overall_events) - group_non_events, 0.0)
-        table = [[events, group_non_events], [rest_events, rest_non_events]]
-        _, p = stats.fisher_exact(table)
-        return float(p), method
-
-    p_group = events / n
-    p_pool = overall_events / overall_n
-    se = np.sqrt(p_pool * (1.0 - p_pool) * (1.0 / n))
-    if se == 0:
-        return np.nan, method
-    z = (p_group - p_pool) / se
-    p = float(2.0 * (1.0 - stats.norm.cdf(abs(z))))
-    return p, method
-
-
-def _select_rate_test(events: float) -> str:
-    """
-    Choose the appropriate test for comparing a group rate against the
-    overall population rate.
-
-    A mid-P exact Poisson test is used for sparse groups (events < 10);
-    otherwise a Poisson (SMR-style) z-test is used.
-    """
-    if events < 10:
-        return "Mid-P exact Poisson"
-    return "Poisson z-test (test-based)"
-
-
-def _test_rate_vs_overall(
-    events: float, denom: float, overall_events: float, overall_denom: float
-) -> tuple[float, str]:
-    """
-    Test a group's rate against the overall/population rate (SMR-style).
-    The overall rate is the fixed reference; expected = overall_rate * denom.
-    """
-    method = _select_rate_test(events)
-    if denom == 0 or overall_denom == 0:
-        return np.nan, method
-
-    overall_rate = overall_events / overall_denom
-    expected = overall_rate * denom
-
-    if expected == 0:
-        return (np.nan if events == 0 else 0.0), method
-
-    if method == "Mid-P exact Poisson":
-        lower_tail = stats.poisson.cdf(events, expected) - 0.5 * stats.poisson.pmf(events, expected)
-        upper_tail = 1.0 - stats.poisson.cdf(events - 1, expected) - 0.5 * stats.poisson.pmf(events, expected)
-        p = 2.0 * min(lower_tail, upper_tail, 0.5)
-        return float(np.clip(p, 0.0, 1.0)), method
-
-    z = (events - expected) / np.sqrt(expected)
-    p = float(2.0 * (1.0 - stats.norm.cdf(abs(z))))
-    return p, method
-
-
-def _select_standardized_test(events: float, has_unreliable_stratum: bool) -> str:
-    """
-    Choose the appropriate test for comparing a standardised proportion/rate
-    against the overall (reference) population value.
-
-    An exact one-sample test (binomial for proportions, mid-P Poisson for
-    rates) is used when the group is sparse or contains an unreliable
-    stratum; otherwise a Dobson-variance z-test is used.
-    """
-    if events < 10 or has_unreliable_stratum:
-        return "Exact one-sample (Byar-based)"
-    return "Dobson z-test vs reference"
-
-
-def _test_dsp_vs_overall(
-    dsp: float, var_dsp: float, overall_proportion: float,
-    crude_events: float, crude_n: float, has_unreliable_stratum: bool,
-) -> tuple[float, str]:
-    """
-    Test a group's DSP against the overall crude proportion.
-
-    Normal-theory path: z = (DSP - overall_proportion) / sqrt(Var(DSP))
-    Exact path: binomial test of crude_events out of crude_n against the
-                overall_proportion as the null probability.
-    """
-    method = _select_standardized_test(crude_events, has_unreliable_stratum)
-    if not np.isfinite(overall_proportion) or crude_n == 0:
-        return np.nan, method
-
-    if method == "Exact one-sample (Byar-based)":
-        result = stats.binomtest(int(round(crude_events)), int(round(crude_n)), overall_proportion)
-        return float(result.pvalue), method
-
-    if not np.isfinite(var_dsp) or var_dsp <= 0:
-        return np.nan, method
-    z = (dsp - overall_proportion) / np.sqrt(var_dsp)
-    p = float(2.0 * (1.0 - stats.norm.cdf(abs(z))))
-    return p, method
-
-
-def _test_dsr_vs_overall(
-    dsr_unscaled: float, var_dsr_unscaled: float, overall_rate_unscaled: float,
-    crude_events: float, crude_denom: float, has_unreliable_stratum: bool,
-) -> tuple[float, str]:
-    """
-    Test a group's DSR against the overall crude rate (SMR-style).
-
-    Normal-theory path: z = (DSR - overall_rate) / sqrt(Var(DSR))
-    Exact path: mid-P Poisson test of crude_events against the "expected"
-                count implied by applying the overall rate to crude_denom.
-    """
-    method = _select_standardized_test(crude_events, has_unreliable_stratum)
-    if not np.isfinite(overall_rate_unscaled) or crude_denom == 0:
-        return np.nan, method
-
-    expected = overall_rate_unscaled * crude_denom
-
-    if method == "Exact one-sample (Byar-based)":
-        if expected == 0:
-            return (np.nan if crude_events == 0 else 0.0), method
-        lower_tail = stats.poisson.cdf(crude_events, expected) - 0.5 * stats.poisson.pmf(crude_events, expected)
-        upper_tail = 1.0 - stats.poisson.cdf(crude_events - 1, expected) - 0.5 * stats.poisson.pmf(crude_events, expected)
-        p = 2.0 * min(lower_tail, upper_tail, 0.5)
-        return float(np.clip(p, 0.0, 1.0)), method
-
-    if not np.isfinite(var_dsr_unscaled) or var_dsr_unscaled <= 0:
-        return np.nan, method
-    z = (dsr_unscaled - overall_rate_unscaled) / np.sqrt(var_dsr_unscaled)
-    p = float(2.0 * (1.0 - stats.norm.cdf(abs(z))))
-    return p, method
-
-
-def _select_correction_method(any_sparse: bool) -> str:
-    """
-    Choose the multiple-testing correction method.
-
-    Dunnett's test is the natural choice for many-to-one comparisons against
-    a shared reference, but its normal-theory assumptions do not hold when
-    exact tests are mixed in for sparse groups, and exact Dunnett adjustment
-    requires the full multivariate-t machinery and joint correlation
-    structure rather than a raw p-value vector. A Holm-Sidak step-down
-    procedure is used instead as a robust, assumption-light approximation
-    to Dunnett-style many-to-one correction. Benjamini-Hochberg (FDR) is
-    used as a fallback whenever any group in the batch is sparse.
-    """
-    return "Benjamini-Hochberg (FDR)" if any_sparse else "Holm-Sidak"
-
-
-def _apply_multiple_testing_correction(
-    p_values: list[float], method: str, alpha: float = 0.05
-) -> list[float]:
-    """
-    Apply a multiple-testing correction to a list of p-values.
-
-    Benjamini-Hochberg (FDR) is applied directly.  Where "Holm-Sidak" is
-    selected, this applies the Holm-Sidak step-down procedure -- a robust,
-    assumption-light approximation to Dunnett-style many-to-one correction,
-    since exact Dunnett adjustment requires the full multivariate-t
-    machinery and joint correlation structure rather than a raw p-value
-    vector.
-    """
-    valid_idx = [i for i, p in enumerate(p_values) if np.isfinite(p)]
-    if not valid_idx:
-        return list(p_values)
-
-    valid_p = np.array([p_values[i] for i in valid_idx])
-    m = len(valid_p)
-
-    if method == "Benjamini-Hochberg (FDR)":
-        order = np.argsort(valid_p)
-        ranked = valid_p[order]
-        adjusted = ranked * m / (np.arange(m) + 1)
-        adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
-        adjusted = np.clip(adjusted, 0, 1)
-        out = np.empty(m)
-        out[order] = adjusted
-    else:
-        order = np.argsort(valid_p)
-        ranked = valid_p[order]
-        adjusted = 1.0 - (1.0 - ranked) ** (m - np.arange(m))
-        adjusted = np.maximum.accumulate(adjusted)
-        adjusted = np.clip(adjusted, 0, 1)
-        out = np.empty(m)
-        out[order] = adjusted
-
-    result = list(p_values)
-    for idx, val in zip(valid_idx, out):
-        result[idx] = float(val)
-    return result
-
-
-def _significance_label(p_adjusted: float, estimate: float, reference: float, alpha: float = 0.05) -> str:
-    """
-    Classify a group's estimate relative to the overall/reference value.
+    Classify a group's estimate relative to a fixed reference value, based
+    purely on whether the reference falls inside or outside the group's own
+    confidence interval (no formal hypothesis test is performed).
 
     Returns one of: "Higher", "Lower", "Not significant", "Not tested".
     """
-    if not np.isfinite(p_adjusted):
+    if not np.isfinite(reference) or not np.isfinite(lower) or not np.isfinite(upper):
         return "Not tested"
-    if p_adjusted >= alpha:
-        return "Not significant"
-    if not np.isfinite(estimate) or not np.isfinite(reference):
-        return "Not tested"
-    return "Higher" if estimate > reference else "Lower"
+    if reference < lower:
+        return "Higher"
+    if reference > upper:
+        return "Lower"
+    return "Not significant"
 
 
 # ===========================================================================
@@ -783,18 +572,14 @@ def crude_proportion_df(
     Returns
     -------
     pl.DataFrame
-        Columns: [*group_cols, events, n, proportion, lower, upper, variance,
-                  std_dev, confidence, method, notes, test_method, p_value,
-                  p_adjusted, significance]
+        Columns: [*group_cols, events, n, proportion, lower, upper,
+                  confidence, method, notes, significance]
         An additional "Overall" row is appended (group_cols set to "Overall")
         summarising the crude proportion across the full input dataset.
-        Each non-Overall row is tested against the Overall proportion using
-        a Fisher exact test (sparse groups) or a two-proportion z-test
-        (otherwise), with p-values corrected for multiple testing across
-        all groups using Benjamini-Hochberg (if any group is sparse) or a
-        Holm-Sidak step-down correction (an approximation to Dunnett's
-        many-to-one comparison-to-reference procedure).
-        The Overall row itself is never tested (it is the reference).
+        Each non-Overall row's significance is assessed by checking whether
+        the fixed Overall proportion falls inside or outside that row's own
+        Wilson score confidence interval -- no formal hypothesis test is
+        performed. The Overall row itself is always labelled "Reference".
     """
     group_cols = list(group_cols or [])
     _check_columns(df, [event_col] + group_cols)
@@ -804,17 +589,15 @@ def crude_proportion_df(
     if not group_cols:
         events = float(df[event_col].sum())
         n = float(len(df))
-        lo, hi, variance, std_dev = _wilson_proportion_ci(events, n, confidence)
+        lo, hi, _ = _wilson_proportion_ci(events, n, confidence)
         proportion = np.nan if n == 0 else events / n
         return pl.DataFrame([{
             "events": events, "n": n,
             "proportion": float(proportion) if np.isfinite(proportion) else np.nan,
             "lower": lo, "upper": hi,
-            "variance": variance, "std_dev": std_dev,
             "confidence": confidence, "method": "Wilson score",
             "notes": _crude_proportion_notes(events, n),
-            "test_method": "Not tested (no groups)", "p_value": np.nan,
-            "p_adjusted": np.nan, "significance": "Not tested",
+            "significance": "Not tested",
         }])
 
     grouped = (
@@ -828,44 +611,29 @@ def crude_proportion_df(
     overall_prop = np.nan if overall_n == 0 else overall_e / overall_n
 
     records = []
-    raw_p_values = []
-    any_sparse = False
     for row in grouped.iter_rows(named=True):
         e, n = float(row["events"]), float(row["n"])
-        lo, hi, variance, std_dev = _wilson_proportion_ci(e, n, confidence)
+        lo, hi, _ = _wilson_proportion_ci(e, n, confidence)
         proportion = np.nan if n == 0 else e / n
-        p_value, test_method = _test_proportion_vs_overall(e, n, overall_e, overall_n)
-        if test_method == "Fisher exact":
-            any_sparse = True
-        raw_p_values.append(p_value)
         records.append({
             **{c: row[c] for c in group_cols},
             "events": e, "n": n,
             "proportion": float(proportion) if np.isfinite(proportion) else np.nan,
             "lower": lo, "upper": hi,
-            "variance": variance, "std_dev": std_dev,
             "confidence": confidence, "method": "Wilson score",
             "notes": _crude_proportion_notes(e, n),
-            "test_method": test_method, "p_value": p_value,
+            "significance": _significance_from_ci(overall_prop, lo, hi),
         })
 
-    correction_method = _select_correction_method(any_sparse)
-    p_adjusted_list = _apply_multiple_testing_correction(raw_p_values, correction_method)
-    for rec, p_adj in zip(records, p_adjusted_list):
-        rec["p_adjusted"] = p_adj
-        rec["significance"] = _significance_label(p_adj, rec["proportion"], overall_prop)
-
-    o_lo, o_hi, o_var, o_sd = _wilson_proportion_ci(overall_e, overall_n, confidence)
+    o_lo, o_hi, _ = _wilson_proportion_ci(overall_e, overall_n, confidence)
     records.append({
         **{c: "Overall" for c in group_cols},
         "events": overall_e, "n": overall_n,
         "proportion": float(overall_prop) if np.isfinite(overall_prop) else np.nan,
         "lower": o_lo, "upper": o_hi,
-        "variance": o_var, "std_dev": o_sd,
         "confidence": confidence, "method": "Wilson score",
         "notes": _crude_proportion_notes(overall_e, overall_n),
-        "test_method": f"Reference row (correction: {correction_method})",
-        "p_value": np.nan, "p_adjusted": np.nan, "significance": "Reference",
+        "significance": "Reference",
     })
     return pl.from_dicts(records)
 
@@ -907,16 +675,13 @@ def crude_rate_df(
     -------
     pl.DataFrame
         Columns: [*group_cols, events, denominator, rate, lower, upper,
-                  variance, std_dev, multiplier, confidence, method, notes,
-                  test_method, p_value, p_adjusted, significance]
+                  multiplier, confidence, method, notes, significance]
         An additional "Overall" row is appended (group_cols set to "Overall")
         summarising the crude rate across the full input dataset.
-        Each non-Overall row is tested against the Overall rate using a
-        mid-P exact Poisson test (sparse groups) or a Poisson (SMR-style)
-        z-test (otherwise), with p-values corrected for multiple testing
-        using Benjamini-Hochberg (if any group is sparse) or a Holm-Sidak
-        step-down correction (a Dunnett approximation).  The Overall row
-        itself is never tested (it is the reference).
+        Each non-Overall row's significance is assessed by checking whether
+        the fixed Overall rate falls inside or outside that row's own
+        confidence interval -- no formal hypothesis test is performed.
+        The Overall row itself is always labelled "Reference".
     """
     group_cols = list(group_cols or [])
     _check_columns(df, [event_col] + group_cols)
@@ -929,22 +694,17 @@ def crude_rate_df(
 
     def _compute_row(e: float, d: float) -> dict:
         if d == 0:
-            return {"rate": np.nan, "lower": np.nan, "upper": np.nan,
-                    "variance": np.nan, "std_dev": np.nan, "method": "undefined"}
+            return {"rate": np.nan, "lower": np.nan, "upper": np.nan, "method": "undefined"}
         if e < 10:
             cnt_lo, cnt_hi = _exact_poisson_count_ci(e, confidence)
             method = "Exact chi-square"
         else:
             cnt_lo, cnt_hi = _byar_count_ci(e, confidence)
             method = "Byar"
-        variance = float(e / (d ** 2)) * (multiplier ** 2)
-        std_dev = float(np.sqrt(variance))
         return {
             "rate": (e / d) * multiplier,
             "lower": (cnt_lo / d) * multiplier,
             "upper": (cnt_hi / d) * multiplier,
-            "variance": variance,
-            "std_dev": std_dev,
             "method": method,
         }
 
@@ -956,8 +716,7 @@ def crude_rate_df(
             "events": e, "denominator": d,
             **r, "multiplier": multiplier, "confidence": confidence,
             "notes": _crude_rate_notes(e, d, used_end_of_period_denom),
-            "test_method": "Not tested (no groups)", "p_value": np.nan,
-            "p_adjusted": np.nan, "significance": "Not tested",
+            "significance": "Not tested",
         }])
 
     grouped = (
@@ -971,28 +730,16 @@ def crude_rate_df(
     overall_rate = np.nan if overall_d == 0 else (overall_e / overall_d) * multiplier
 
     records = []
-    raw_p_values = []
-    any_sparse = False
     for row in grouped.iter_rows(named=True):
         e, d = float(row["events"]), float(row["denominator"])
         r = _compute_row(e, d)
-        p_value, test_method = _test_rate_vs_overall(e, d, overall_e, overall_d)
-        if test_method == "Mid-P exact Poisson":
-            any_sparse = True
-        raw_p_values.append(p_value)
         records.append({
             **{c: row[c] for c in group_cols},
             "events": e, "denominator": d,
             **r, "multiplier": multiplier, "confidence": confidence,
             "notes": _crude_rate_notes(e, d, used_end_of_period_denom),
-            "test_method": test_method, "p_value": p_value,
+            "significance": _significance_from_ci(overall_rate, r["lower"], r["upper"]),
         })
-
-    correction_method = _select_correction_method(any_sparse)
-    p_adjusted_list = _apply_multiple_testing_correction(raw_p_values, correction_method)
-    for rec, p_adj in zip(records, p_adjusted_list):
-        rec["p_adjusted"] = p_adj
-        rec["significance"] = _significance_label(p_adj, rec["rate"], overall_rate)
 
     r_overall = _compute_row(overall_e, overall_d)
     records.append({
@@ -1000,8 +747,7 @@ def crude_rate_df(
         "events": overall_e, "denominator": overall_d,
         **r_overall, "multiplier": multiplier, "confidence": confidence,
         "notes": _crude_rate_notes(overall_e, overall_d, used_end_of_period_denom),
-        "test_method": f"Reference row (correction: {correction_method})",
-        "p_value": np.nan, "p_adjusted": np.nan, "significance": "Reference",
+        "significance": "Reference",
     })
     return pl.from_dicts(records)
 
@@ -1036,19 +782,17 @@ def directly_standardized_proportion_df(
     Returns
     -------
     pl.DataFrame
-        Columns: [*group_cols, events, n, dsp, dsp_lower, dsp_upper, variance,
-                  std_dev, notes, test_method, p_value, p_adjusted, significance]
+        Columns: [*group_cols, events, n, dsp, dsp_lower, dsp_upper, notes,
+                  significance]
         An additional "Overall" row is appended (group_cols set to "Overall")
         giving the crude (unstandardised) proportion across the full input
         dataset, with its own Wilson-Dobson CI. Because this row IS the
         reference population used to build the standardisation weights, it
         requires no weighting -- this is stated explicitly in its notes.
-        Each non-Overall row is tested against the Overall proportion using
-        an exact one-sample binomial test (sparse groups or unreliable
-        strata) or a Dobson-variance z-test (otherwise), with p-values
-        corrected for multiple testing using Benjamini-Hochberg (if any
-        group is sparse) or a Holm-Sidak step-down correction (a Dunnett
-        approximation) otherwise.  The Overall row itself is never tested.
+        Each non-Overall row's significance is assessed by checking whether
+        the fixed Overall proportion falls inside or outside that row's own
+        dsp_lower/dsp_upper interval -- no formal hypothesis test is
+        performed. The Overall row itself is always labelled "Reference".
 
     Notes
     -----
@@ -1076,8 +820,6 @@ def directly_standardized_proportion_df(
     overall_proportion = overall_events / overall_n if overall_n > 0 else np.nan
 
     records = []
-    raw_p_values = []
-    any_sparse = False
     for row in group_combinations.iter_rows(named=True):
         group_data = _filter_group(work_df, row)
         crude_events = float(group_data[event_col].sum())
@@ -1087,7 +829,7 @@ def directly_standardized_proportion_df(
             group_data, all_strata, event_col, strata_cols, ref_weights
         )
         dsp = float(np.sum(s["stratum_weights"] * s["stratum_props"]))
-        dsp_lower, dsp_upper, _, var_dsp, sd_dsp = _wilson_dobson_proportion_ci(
+        dsp_lower, dsp_upper, _ = _wilson_dobson_proportion_ci(
             dsp, crude_events, crude_n,
             s["stratum_weights"], s["stratum_props"], s["stratum_ns"], confidence,
         )
@@ -1116,38 +858,22 @@ def directly_standardized_proportion_df(
         if has_unreliable_non_events:
             notes.append("Unreliable: stratum non-event count <10")
 
-        p_value, test_method = _test_dsp_vs_overall(
-            dsp, var_dsp, overall_proportion, crude_events, crude_n,
-            has_unreliable_stratum or has_unreliable_non_events,
-        )
-        if test_method == "Exact one-sample (Byar-based)":
-            any_sparse = True
-        raw_p_values.append(p_value)
-
         records.append({
             **row,
             "events": int(crude_events), "n": int(crude_n),
             "dsp": round(dsp, 6),
             "dsp_lower": round(dsp_lower, 6),
             "dsp_upper": round(dsp_upper, 6),
-            "variance": round(var_dsp, 10) if np.isfinite(var_dsp) else np.nan,
-            "std_dev": round(sd_dsp, 10) if np.isfinite(sd_dsp) else np.nan,
             "notes": " | ".join(notes),
-            "test_method": test_method, "p_value": p_value,
+            "significance": _significance_from_ci(overall_proportion, dsp_lower, dsp_upper),
         })
 
-    correction_method = _select_correction_method(any_sparse)
-    p_adjusted_list = _apply_multiple_testing_correction(raw_p_values, correction_method)
-    for rec, p_adj in zip(records, p_adjusted_list):
-        rec["p_adjusted"] = p_adj
-        rec["significance"] = _significance_label(p_adj, rec["dsp"], overall_proportion)
-
-    o_lo, o_hi, _, o_var, o_sd = _wilson_dobson_proportion_ci(
+    o_lo, o_hi, _ = _wilson_dobson_proportion_ci(
         overall_proportion,
         overall_events, overall_n,
         np.array([1.0]), np.array([overall_proportion]),
         np.array([overall_n]), confidence,
-    ) if overall_n > 0 else (np.nan, np.nan, np.nan, np.nan, np.nan)
+    ) if overall_n > 0 else (np.nan, np.nan, np.nan)
     overall_non_events = overall_n - overall_events
 
     overall_notes = []
@@ -1169,21 +895,16 @@ def directly_standardized_proportion_df(
         "dsp": round(overall_proportion, 6) if np.isfinite(overall_proportion) else np.nan,
         "dsp_lower": round(o_lo, 6) if np.isfinite(o_lo) else np.nan,
         "dsp_upper": round(o_hi, 6) if np.isfinite(o_hi) else np.nan,
-        "variance": round(o_var, 10) if np.isfinite(o_var) else np.nan,
-        "std_dev": round(o_sd, 10) if np.isfinite(o_sd) else np.nan,
         "notes": " | ".join(overall_notes),
-        "test_method": f"Reference row (correction: {correction_method})",
-        "p_value": np.nan, "p_adjusted": np.nan, "significance": "Reference",
+        "significance": "Reference",
     })
 
     if not records:
         schema = {c: pl.Utf8 for c in group_cols}
         schema.update({"events": pl.Int64, "n": pl.Int64,
                         "dsp": pl.Float64, "dsp_lower": pl.Float64,
-                        "dsp_upper": pl.Float64, "variance": pl.Float64,
-                        "std_dev": pl.Float64, "notes": pl.Utf8,
-                        "test_method": pl.Utf8, "p_value": pl.Float64,
-                        "p_adjusted": pl.Float64, "significance": pl.Utf8})
+                        "dsp_upper": pl.Float64, "notes": pl.Utf8,
+                        "significance": pl.Utf8})
         return pl.DataFrame(schema=schema)
     return pl.from_dicts(records)
 
@@ -1230,19 +951,16 @@ def directly_standardized_rate_df(
     -------
     pl.DataFrame
         Columns: [*group_cols, events, denominator, dsr, dsr_lower, dsr_upper,
-                  variance, std_dev, multiplier, notes, test_method, p_value,
-                  p_adjusted, significance]
+                  multiplier, notes, significance]
         An additional "Overall" row is appended (group_cols set to "Overall")
         giving the crude (unstandardised) rate across the full input dataset,
         with its own Dobson-Byar/exact CI. Because this row IS the reference
         population used to build the standardisation weights, it requires no
         weighting -- this is stated explicitly in its notes.
-        Each non-Overall row is tested against the Overall rate using an
-        exact one-sample mid-P Poisson test (sparse groups or unreliable
-        strata) or a Dobson-variance z-test (otherwise, SMR-style), with
-        p-values corrected for multiple testing using Benjamini-Hochberg (if
-        any group is sparse) or a Holm-Sidak step-down correction (a Dunnett
-        approximation) otherwise.  The Overall row itself is never tested.
+        Each non-Overall row's significance is assessed by checking whether
+        the fixed Overall rate falls inside or outside that row's own
+        dsr_lower/dsr_upper interval -- no formal hypothesis test is
+        performed. The Overall row itself is always labelled "Reference".
 
     Notes
     -----
@@ -1276,8 +994,6 @@ def directly_standardized_rate_df(
         return round(v * multiplier, 6) if np.isfinite(v) else np.nan
 
     records = []
-    raw_p_values = []
-    any_sparse = False
     for row in group_combinations.iter_rows(named=True):
         group_data = _filter_group(work_df, row)
         crude_events = float(group_data[event_col].sum())
@@ -1291,7 +1007,7 @@ def directly_standardized_rate_df(
             float(np.sum(s["stratum_weights"] * s["stratum_rates"]) / w_sum)
             if w_sum > 0 else np.nan
         )
-        lo_u, hi_u, _, var_dsr_u, sd_dsr_u = _dobson_byar_rate_ci(
+        lo_u, hi_u, _ = _dobson_byar_rate_ci(
             dsr_u, crude_events,
             s["stratum_weights"], s["stratum_events"], s["stratum_denoms"], confidence,
         )
@@ -1315,38 +1031,25 @@ def directly_standardized_rate_df(
         if has_unreliable_stratum:
             notes.append("Unreliable: stratum denominator <10")
 
-        p_value, test_method = _test_dsr_vs_overall(
-            dsr_u, var_dsr_u, overall_rate_u, crude_events, crude_denom,
-            has_unreliable_stratum,
-        )
-        if test_method == "Exact one-sample (Byar-based)":
-            any_sparse = True
-        raw_p_values.append(p_value)
-
-        var_dsr_scaled = float(var_dsr_u * (multiplier ** 2)) if np.isfinite(var_dsr_u) else np.nan
-        sd_dsr_scaled = float(np.sqrt(var_dsr_scaled)) if np.isfinite(var_dsr_scaled) else np.nan
+        dsr_scaled = _scale(dsr_u)
+        lo_scaled = _scale(lo_u)
+        hi_scaled = _scale(hi_u)
         records.append({
             **row,
             "events": int(crude_events), "denominator": round(crude_denom, 6),
-            "dsr": _scale(dsr_u),
-            "dsr_lower": _scale(lo_u),
-            "dsr_upper": _scale(hi_u),
-            "variance": round(var_dsr_scaled, 6) if np.isfinite(var_dsr_scaled) else np.nan,
-            "std_dev": round(sd_dsr_scaled, 6) if np.isfinite(sd_dsr_scaled) else np.nan,
+            "dsr": dsr_scaled,
+            "dsr_lower": lo_scaled,
+            "dsr_upper": hi_scaled,
             "multiplier": multiplier,
             "notes": " | ".join(notes),
-            "test_method": test_method, "p_value": p_value,
+            "significance": _significance_from_ci(
+                overall_rate_u * multiplier if np.isfinite(overall_rate_u) else np.nan,
+                lo_scaled, hi_scaled,
+            ),
         })
 
-    correction_method = _select_correction_method(any_sparse)
-    p_adjusted_list = _apply_multiple_testing_correction(raw_p_values, correction_method)
-    overall_rate_scaled = _scale(overall_rate_u)
-    for rec, p_adj in zip(records, p_adjusted_list):
-        rec["p_adjusted"] = p_adj
-        rec["significance"] = _significance_label(p_adj, rec["dsr"], overall_rate_scaled)
-
     if overall_denom == 0:
-        o_lo_u, o_hi_u, o_var_u = np.nan, np.nan, np.nan
+        o_lo_u, o_hi_u = np.nan, np.nan
     else:
         if overall_events < 10:
             cnt_lo, cnt_hi = _exact_poisson_count_ci(overall_events, confidence)
@@ -1354,7 +1057,6 @@ def directly_standardized_rate_df(
             cnt_lo, cnt_hi = _byar_count_ci(overall_events, confidence)
         o_lo_u = cnt_lo / overall_denom
         o_hi_u = cnt_hi / overall_denom
-        o_var_u = overall_events / (overall_denom ** 2)
 
     overall_notes = []
     if used_end_of_period_denom:
@@ -1373,31 +1075,23 @@ def directly_standardized_rate_df(
         "Overall rate: no weighting applied as this row is itself the reference population"
     )
 
-    var_overall_scaled = float(o_var_u * (multiplier ** 2)) if np.isfinite(o_var_u) else np.nan
-    sd_overall_scaled = float(np.sqrt(var_overall_scaled)) if np.isfinite(var_overall_scaled) else np.nan
-
+    overall_rate_scaled = _scale(overall_rate_u)
     records.append({
         **{c: "Overall" for c in group_cols},
         "events": int(overall_events), "denominator": round(overall_denom, 6),
         "dsr": overall_rate_scaled,
         "dsr_lower": _scale(o_lo_u),
         "dsr_upper": _scale(o_hi_u),
-        "variance": round(var_overall_scaled, 6) if np.isfinite(var_overall_scaled) else np.nan,
-        "std_dev": round(sd_overall_scaled, 6) if np.isfinite(sd_overall_scaled) else np.nan,
         "multiplier": multiplier,
         "notes": " | ".join(overall_notes),
-        "test_method": f"Reference row (correction: {correction_method})",
-        "p_value": np.nan, "p_adjusted": np.nan, "significance": "Reference",
+        "significance": "Reference",
     })
 
     if not records:
         schema = {c: pl.Utf8 for c in group_cols}
         schema.update({"events": pl.Int64, "denominator": pl.Float64,
                         "dsr": pl.Float64, "dsr_lower": pl.Float64,
-                        "dsr_upper": pl.Float64, "variance": pl.Float64,
-                        "std_dev": pl.Float64, "multiplier": pl.Float64,
-                        "notes": pl.Utf8, "test_method": pl.Utf8,
-                        "p_value": pl.Float64, "p_adjusted": pl.Float64,
-                        "significance": pl.Utf8})
+                        "dsr_upper": pl.Float64, "multiplier": pl.Float64,
+                        "notes": pl.Utf8, "significance": pl.Utf8})
         return pl.DataFrame(schema=schema)
     return pl.from_dicts(records)
