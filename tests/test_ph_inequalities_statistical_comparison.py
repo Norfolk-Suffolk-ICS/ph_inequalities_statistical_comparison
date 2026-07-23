@@ -8,7 +8,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from ph_inequalities_statistical_comparison import (
+from ph_inequalities_statistical_comparison.core import (
     _bin_numeric_to_quartiles,
     _wilson_proportion_ci,
     _byar_count_ci,
