@@ -332,6 +332,10 @@ def _wilson_dobson_proportion_ci(
     p_lo, p_hi, var_crude = _wilson_proportion_ci(crude_events, crude_n, confidence)
 
     if var_crude == 0 or not np.isfinite(var_crude):
+        corrected_p, corrected_e, corrected_n = _haldane_proportion_correction(crude_events, crude_n)
+        var_crude = corrected_p * (1 - corrected_p) / corrected_n
+
+    if var_crude == 0 or not np.isfinite(var_crude):
         return float(dsp), float(dsp), var_dsp
 
     scale = float(np.sqrt(var_dsp / var_crude))
