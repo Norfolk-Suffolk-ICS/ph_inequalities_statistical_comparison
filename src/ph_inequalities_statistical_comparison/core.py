@@ -428,6 +428,10 @@ def _dobson_byar_rate_ci(
     var_dsr = float(np.sum((w ** 2) * Oi / (ni ** 2)) / (w_sum ** 2))
     var_O = float(crude_events)
 
+    if var_O == 0.0:
+        _, corrected_events, _ = _haldane_rate_correction(crude_events, 1.0)
+        var_O = corrected_events
+
     if var_O == 0.0 or var_dsr == 0.0:
         return float(dsr_unscaled), float(dsr_unscaled), var_dsr
 
@@ -435,7 +439,6 @@ def _dobson_byar_rate_ci(
     lower = dsr_unscaled + scale * (O_lo - crude_events)
     upper = dsr_unscaled + scale * (O_hi - crude_events)
     return float(max(lower, 0.0)), float(max(upper, 0.0)), var_dsr
-
 
 def _compute_rate_stratum_stats(
     group_data: pl.DataFrame, all_strata: pl.DataFrame,
