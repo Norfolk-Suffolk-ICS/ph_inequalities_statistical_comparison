@@ -83,6 +83,11 @@ from scipy import stats
 # Shared helpers
 # ===========================================================================
 
+def _cast_group_cols_to_utf8(df: pl.DataFrame, group_cols: list[str]) -> pl.DataFrame:
+    if not group_cols:
+        return df
+    return df.with_columns([pl.col(c).cast(pl.Utf8) for c in group_cols])
+
 def _bin_numeric_to_quartiles(series: pl.Series) -> pl.Series:
     """Bin a numeric Polars series into quartile labels Q1-Q4."""
     try:
@@ -582,6 +587,7 @@ def crude_proportion_df(
         performed. The Overall row itself is always labelled "Reference".
     """
     group_cols = list(group_cols or [])
+    df = _cast_group_cols_to_utf8(df, group_cols)
     _check_columns(df, [event_col] + group_cols)
     _check_no_nulls(df, [event_col] + group_cols)
     df = _validate_numerator_col(df, event_col, binary=True)
@@ -684,6 +690,7 @@ def crude_rate_df(
         The Overall row itself is always labelled "Reference".
     """
     group_cols = list(group_cols or [])
+    df = _cast_group_cols_to_utf8(df, group_cols)
     _check_columns(df, [event_col] + group_cols)
     _check_no_nulls(df, [event_col] + group_cols)
     df = _validate_numerator_col(df, event_col, binary=False)
@@ -809,6 +816,7 @@ def directly_standardized_proportion_df(
     """
     strata_cols = list(strata_cols)
     group_cols = list(group_cols)
+    df = _cast_group_cols_to_utf8(df, group_cols)
 
     work_df = _prepare_dataframe_proportion(df, event_col, strata_cols, group_cols)
     ref_weights = _build_reference_weights(work_df, strata_cols)
@@ -977,6 +985,7 @@ def directly_standardized_rate_df(
     """
     strata_cols = list(strata_cols)
     group_cols = list(group_cols)
+    df = _cast_group_cols_to_utf8(df, group_cols)
 
     work_df = _add_end_of_period_denominator(df)
     denom_col = _DENOM_COL
