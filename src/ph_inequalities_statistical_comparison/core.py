@@ -72,7 +72,10 @@ Dependencies: polars, numpy, scipy
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from itertools import combinations, product
+from typing import Literal
 
 import numpy as np
 import polars as pl
@@ -246,6 +249,189 @@ def _filter_group(df: pl.DataFrame, row: dict) -> pl.DataFrame:
     for col, val in row.items():
         mask = mask & (pl.col(col) == val)
     return df.filter(mask)
+
+
+@dataclass(frozen=True)
+class _GroupingSet:
+    active_cols: tuple[str, ...]
+
+
+def _normalise_hierarchies(
+    organisational_cols: Mapping[str, Sequence[str]] | None,
+) -> dict[str, tuple[str, ...]]:
+    if organisational_cols is None:
+        return {}
+    if not isinstance(organisational_cols, Mapping):
+        raise TypeError(
+            "organisational_cols must be a named mapping, for example "
+            "{'commissioning': ['region', 'icb', 'practice']}."
+        )
+    result = {}
+    for name, levels in organisational_cols.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Hierarchy names must be non-empty strings.")
+        if isinstance(levels, (str, bytes)) or not isinstance(levels, Sequence):
+            raise TypeError(
+                f"Hierarchy '{name}' must be an ordered sequence of columns "
+                "from highest to lowest level."
+            )
+        levels = tuple(levels)
+        if not levels:
+            raise ValueError(f"Hierarchy '{name}' must contain at least one column.")
+        if any(not isinstance(col, str) or not col for col in levels):
+            raise ValueError(f"Hierarchy '{name}' contains an invalid column name.")
+        if len(levels) != len(set(levels)):
+            raise ValueError(f"Hierarchy '{name}' contains duplicate columns.")
+        result[name] = levels
+    return result
+
+
+def _prepare_dimensions(
+    df: pl.DataFrame,
+    event_col: str,
+    strata_cols: Sequence[str],
+    inequalities_cols: Sequence[str] | None,
+    organisational_cols: Mapping[str, Sequence[str]] | None,
+    organisational_mode: Literal["separate", "cross"],
+    all_label: str,
+) -> tuple[pl.DataFrame, list[str], dict[str, tuple[str, ...]], list[str]]:
+    if organisational_mode not in {"separate", "cross"}:
+        raise ValueError("organisational_mode must be 'separate' or 'cross'.")
+    if not isinstance(all_label, str) or not all_label:
+        raise ValueError("all_label must be a non-empty string.")
+    if inequalities_cols is None:
+        inequalities = []
+    elif isinstance(inequalities_cols, (str, bytes)) or not isinstance(inequalities_cols, Sequence):
+        raise TypeError("inequalities_cols must be a sequence or None.")
+    else:
+        inequalities = list(inequalities_cols)
+    if any(not isinstance(col, str) or not col for col in inequalities):
+        raise ValueError("inequalities_cols contains an invalid column name.")
+    if len(inequalities) != len(set(inequalities)):
+        raise ValueError("inequalities_cols contains duplicate columns.")
+
+    hierarchies = _normalise_hierarchies(organisational_cols)
+    organisational = [col for levels in hierarchies.values() for col in levels]
+    repeated = sorted({col for col in organisational if organisational.count(col) > 1})
+    if repeated:
+        raise ValueError(f"Organisational columns occur in multiple hierarchies: {repeated}.")
+    overlap = sorted(set(inequalities) & set(organisational))
+    if overlap:
+        raise ValueError(f"Columns cannot be both inequality and organisational: {overlap}.")
+
+    strata = list(strata_cols)
+    if len(strata) != len(set(strata)):
+        raise ValueError("strata_cols contains duplicate columns.")
+    dimensions = organisational + inequalities
+    overlap = sorted(set(strata) & set(dimensions))
+    if overlap:
+        raise ValueError(f"Strata cannot also be grouping dimensions: {overlap}.")
+    if event_col in dimensions or event_col in strata:
+        raise ValueError("event_col cannot also be a stratum or grouping dimension.")
+
+    required = [event_col] + strata + dimensions
+    _check_columns(df, required)
+    _check_no_nulls(df, required)
+    conflicts = [
+        col for col in dimensions
+        if df.select(pl.col(col).cast(pl.Utf8).eq(all_label).any()).item()
+    ]
+    if conflicts:
+        raise ValueError(
+            f"Reserved all_label {all_label!r} occurs in columns {conflicts}; "
+            "choose another all_label or recode the source values."
+        )
+    if dimensions:
+        df = df.with_columns(pl.col(col).cast(pl.Utf8) for col in dimensions)
+
+    for name, levels in hierarchies.items():
+        for parent, child in zip(levels, levels[1:]):
+            invalid = (
+                df.select(parent, child).unique()
+                .group_by(child)
+                .agg(pl.col(parent).n_unique().alias("_parents"))
+                .filter(pl.col("_parents") != 1)
+            )
+            if invalid.height:
+                examples = invalid[child].head(5).to_list()
+                raise ValueError(
+                    f"Invalid hierarchy '{name}': '{child}' does not map to exactly "
+                    f"one '{parent}'. Example values: {examples}. Hierarchies must be "
+                    "ordered highest to lowest and cannot be many-to-many."
+                )
+    return df, inequalities, hierarchies, dimensions
+
+
+def _inequality_states(cols: list[str]) -> list[tuple[str, ...]]:
+    return [
+        tuple(active)
+        for size in range(len(cols), -1, -1)
+        for active in combinations(cols, size)
+    ]
+
+
+def _organisational_states(
+    hierarchies: Mapping[str, tuple[str, ...]],
+    mode: Literal["separate", "cross"],
+) -> list[tuple[str, ...]]:
+    if not hierarchies:
+        return [tuple()]
+    if mode == "separate":
+        states = [
+            tuple(levels[:depth])
+            for levels in hierarchies.values()
+            for depth in range(len(levels), 0, -1)
+        ]
+        return states + [tuple()]
+    choices = [
+        [tuple(levels[:depth]) for depth in range(len(levels), -1, -1)]
+        for levels in hierarchies.values()
+    ]
+    return [tuple(col for state in states for col in state) for states in product(*choices)]
+
+
+def _build_grouping_sets(
+    inequalities: list[str],
+    hierarchies: Mapping[str, tuple[str, ...]],
+    mode: Literal["separate", "cross"],
+) -> list[_GroupingSet]:
+    candidates = [
+        org + inequality
+        for org in _organisational_states(hierarchies, mode)
+        for inequality in _inequality_states(inequalities)
+    ]
+    seen = set()
+    result = []
+    for active in candidates:
+        if active not in seen:
+            seen.add(active)
+            result.append(_GroupingSet(active))
+    return result
+
+
+def _iter_group_slices(
+    df: pl.DataFrame,
+    dimensions: list[str],
+    grouping_sets: Sequence[_GroupingSet],
+    all_label: str,
+):
+    for grouping_set in grouping_sets:
+        active = list(grouping_set.active_cols)
+        keys = (
+            df.select(active).unique(maintain_order=True).sort(active).iter_rows(named=True)
+            if active else iter([{}])
+        )
+        for key in keys:
+            group_data = _filter_group(df, key) if active else df
+            display = {col: key[col] if col in active else all_label for col in dimensions}
+            yield display, group_data, not active
+
+
+def _validate_options(confidence: float, multiplier: float | None = None) -> None:
+    if not 0 < confidence < 1:
+        raise ValueError("confidence must be strictly between 0 and 1.")
+    if multiplier is not None and (not np.isfinite(multiplier) or multiplier <= 0):
+        raise ValueError("multiplier must be finite and positive.")
 
 
 # ===========================================================================
@@ -497,17 +683,22 @@ def _compute_rate_stratum_stats(
 def _crude_proportion_notes(events: float, n: float) -> str:
     notes = []
     if n == 0:
-        notes.append("Zero denominator")
+        notes.append("Zero denominator - must suppress and consider changing oganisational heirachy and inequalities being passed to functions")
     else:
         if events == 0:
-            notes.append("Zero events")
+            notes.append("Zero events - must flag that confidence intervals are not robust")
         elif events < 10:
-            notes.append("Low event count (<10)")
+            notes.append("Low event count (<10) - must flag as unstable or suppress in visual")
         non_events = n - events
         if non_events == 0:
-            notes.append("All events (proportion = 1)")
+            notes.append("All events (proportion = 1) - must flag as degenerate or suppress in visual")
         elif non_events < 10:
-            notes.append("Low non-event count (<10)")
+            notes.append("Zero events - must flag that confidence intervals are not robust")
+
+    if n < 40:
+        notes.append("Low sample size - must flag that rate is unstable")
+
+
     return " | ".join(notes)
 
 
@@ -523,10 +714,12 @@ def _crude_rate_notes(events: float, denominator: float, end_of_period_denom: bo
         notes.append("Zero denominator")
     else:
         if events == 0:
-            notes.append("Zero events")
+            notes.append("Zero events - must flag that confidence intervals are not robust")
         elif events < 10:
-            notes.append("Low event count (<10): consider suppression")
-    return " | ".join(notes)
+            notes.append("Low event count (<10) - must flag as unstable or suppress in visual")
+
+    if denominator < 40:
+        notes.append("Low sample size - must flag that rate is unstable")
 
 
 # ===========================================================================
@@ -555,6 +748,8 @@ def _significance_from_ci(reference: float, lower: float, upper: float) -> str:
     return "Not significant"
 
 
+
+
 # ===========================================================================
 # Public functions
 # ===========================================================================
@@ -562,207 +757,82 @@ def _significance_from_ci(reference: float, lower: float, upper: float) -> str:
 def crude_proportion_df(
     df: pl.DataFrame,
     event_col: str,
-    group_cols: Sequence[str] | None = None,
+    inequalities_cols: Sequence[str] | None = None,
+    organisational_cols: Mapping[str, Sequence[str]] | None = None,
+    *,
+    organisational_mode: Literal["separate", "cross"] = "separate",
+    all_label: str = "All",
     confidence: float = 0.95,
 ) -> pl.DataFrame:
-    """
-    Compute crude proportions with Wilson score confidence intervals.
-
-    Parameters
-    ----------
-    df : pl.DataFrame
-        Input dataset containing event_col and any group_cols.
-    event_col : str
-        Binary event indicator column (0/1 or boolean).
-        The proportion is computed as sum(event_col) / row_count.
-    group_cols : Sequence[str] | None
-        Columns to group by.  One output row per unique combination.
-        If None or empty, a single overall row is returned.
-    confidence : float, default 0.95
-        Confidence level for the Wilson interval.
-
-    Returns
-    -------
-    pl.DataFrame
-        Columns: [*group_cols, events, n, proportion, lower, upper,
-                  confidence, method, notes, significance]
-        An additional "Overall" row is appended (group_cols set to "Overall")
-        summarising the crude proportion across the full input dataset.
-        Each non-Overall row's significance is assessed by checking whether
-        the fixed Overall proportion falls inside or outside that row's own
-        Wilson score confidence interval -- no formal hypothesis test is
-        performed. The Overall row itself is always labelled "Reference".
-    """
-    group_cols = list(group_cols or [])
-    df = _cast_group_cols_to_utf8(df, group_cols)
-    _check_columns(df, [event_col] + group_cols)
-    _check_no_nulls(df, [event_col] + group_cols)
-    df = _validate_numerator_col(df, event_col, binary=True)
-
-    if not group_cols:
-        events = float(df[event_col].sum())
-        n = float(len(df))
-        lo, hi, _ = _wilson_proportion_ci(events, n, confidence)
-        proportion = np.nan if n == 0 else events / n
-        return pl.DataFrame([{
-            "events": events, "n": n,
-            "proportion": float(proportion) if np.isfinite(proportion) else np.nan,
-            "lower": lo, "upper": hi,
-            "confidence": confidence, "method": "Wilson score",
-            "notes": _crude_proportion_notes(events, n),
-            "significance": "Not tested",
-        }])
-
-    grouped = (
-        df.group_by(group_cols)
-        .agg([pl.col(event_col).sum().alias("events"), pl.len().alias("n")])
-        .sort(group_cols)
+    """Crude proportions over hierarchy roll-ups and the full inequality cube."""
+    _validate_options(confidence)
+    df, inequalities, hierarchies, dimensions = _prepare_dimensions(
+        df, event_col, [], inequalities_cols, organisational_cols,
+        organisational_mode, all_label,
     )
-
-    overall_e = float(df[event_col].sum())
-    overall_n = float(len(df))
-    overall_prop = np.nan if overall_n == 0 else overall_e / overall_n
-
+    df = _validate_numerator_col(df, event_col, binary=True)
+    sets = _build_grouping_sets(inequalities, hierarchies, organisational_mode)
+    overall_e, overall_n = float(df[event_col].sum()), float(len(df))
+    reference = overall_e / overall_n if overall_n else np.nan
     records = []
-    for row in grouped.iter_rows(named=True):
-        e, n = float(row["events"]), float(row["n"])
-        lo, hi, _ = _wilson_proportion_ci(e, n, confidence)
-        proportion = np.nan if n == 0 else e / n
+    for key, data, is_reference in _iter_group_slices(df, dimensions, sets, all_label):
+        events, n = float(data[event_col].sum()), float(len(data))
+        lower, upper, _ = _wilson_proportion_ci(events, n, confidence)
+        estimate = events / n if n else np.nan
         records.append({
-            **{c: row[c] for c in group_cols},
-            "events": e, "n": n,
-            "proportion": float(proportion) if np.isfinite(proportion) else np.nan,
-            "lower": lo, "upper": hi,
-            "confidence": confidence, "method": "Wilson score",
-            "notes": _crude_proportion_notes(e, n),
-            "significance": _significance_from_ci(overall_prop, lo, hi),
+            **key, "events": events, "n": n, "proportion": estimate,
+            "lower": lower, "upper": upper, "confidence": confidence,
+            "method": "Wilson score", "notes": _crude_proportion_notes(events, n),
+            "significance": "Reference" if is_reference else _significance_from_ci(reference, lower, upper),
         })
-
-    o_lo, o_hi, _ = _wilson_proportion_ci(overall_e, overall_n, confidence)
-    records.append({
-        **{c: "Overall" for c in group_cols},
-        "events": overall_e, "n": overall_n,
-        "proportion": float(overall_prop) if np.isfinite(overall_prop) else np.nan,
-        "lower": o_lo, "upper": o_hi,
-        "confidence": confidence, "method": "Wilson score",
-        "notes": _crude_proportion_notes(overall_e, overall_n),
-        "significance": "Reference",
-    })
     return pl.from_dicts(records)
 
 
 def crude_rate_df(
     df: pl.DataFrame,
     event_col: str,
-    group_cols: Sequence[str] | None = None,
+    inequalities_cols: Sequence[str] | None = None,
+    organisational_cols: Mapping[str, Sequence[str]] | None = None,
+    *,
+    organisational_mode: Literal["separate", "cross"] = "separate",
+    all_label: str = "All",
     multiplier: float = 100_000.0,
     confidence: float = 0.95,
 ) -> pl.DataFrame:
-    """
-    Compute crude rates with exact chi-square (count < 10) or Byar (count >= 10) CIs.
+    """Crude rates over hierarchy roll-ups and the full inequality cube."""
+    _validate_options(confidence, multiplier)
+    df, inequalities, hierarchies, dimensions = _prepare_dimensions(
+        df, event_col, [], inequalities_cols, organisational_cols,
+        organisational_mode, all_label,
+    )
+    df = _add_end_of_period_denominator(_validate_numerator_col(df, event_col, binary=False))
+    sets = _build_grouping_sets(inequalities, hierarchies, organisational_mode)
+    overall_e, overall_d = float(df[event_col].sum()), float(df[_DENOM_COL].sum())
+    reference = overall_e / overall_d * multiplier if overall_d else np.nan
 
-    The denominator (exposure) is ALWAYS inferred from row count: each row is
-    treated as one unit of exposure (1 patient = 1 row), interpreted as the
-    population/headcount at the END of the reporting period. This is the
-    only supported denominator method in this module -- it is a simplifying
-    assumption for patient-level dataframes where true person-time is
-    unavailable: patients who did not experience the full exposure period
-    are still counted as a full unit. This is flagged explicitly via the
-    "End-of-period denominator" entry in notes on every row.
-
-    Parameters
-    ----------
-    df : pl.DataFrame
-        Input dataset. One row is assumed to represent one unit of exposure.
-    event_col : str
-        Column containing observed event counts.
-    group_cols : Sequence[str] | None
-        Grouping columns.  One output row per unique combination.
-        If None or empty, a single overall row is returned.
-    multiplier : float, default 100_000
-        Rate scaling factor (e.g. 100_000 for per 100,000).
-    confidence : float, default 0.95
-        Confidence level.
-
-    Returns
-    -------
-    pl.DataFrame
-        Columns: [*group_cols, events, denominator, rate, lower, upper,
-                  multiplier, confidence, method, notes, significance]
-        An additional "Overall" row is appended (group_cols set to "Overall")
-        summarising the crude rate across the full input dataset.
-        Each non-Overall row's significance is assessed by checking whether
-        the fixed Overall rate falls inside or outside that row's own
-        confidence interval -- no formal hypothesis test is performed.
-        The Overall row itself is always labelled "Reference".
-    """
-    group_cols = list(group_cols or [])
-    df = _cast_group_cols_to_utf8(df, group_cols)
-    _check_columns(df, [event_col] + group_cols)
-    _check_no_nulls(df, [event_col] + group_cols)
-    df = _validate_numerator_col(df, event_col, binary=False)
-
-    df = _add_end_of_period_denominator(df)
-    denom_col = _DENOM_COL
-    used_end_of_period_denom = True
-
-    def _compute_row(e: float, d: float) -> dict:
-        if d == 0:
-            return {"rate": np.nan, "lower": np.nan, "upper": np.nan, "method": "undefined"}
-        if e < 10:
-            cnt_lo, cnt_hi = _exact_poisson_count_ci(e, confidence)
+    def calculate(events, denominator):
+        if not denominator:
+            return np.nan, np.nan, np.nan, "undefined"
+        if events < 10:
+            low, high = _exact_poisson_count_ci(events, confidence)
             method = "Exact chi-square"
         else:
-            cnt_lo, cnt_hi = _byar_count_ci(e, confidence)
+            low, high = _byar_count_ci(events, confidence)
             method = "Byar"
-        return {
-            "rate": (e / d) * multiplier,
-            "lower": (cnt_lo / d) * multiplier,
-            "upper": (cnt_hi / d) * multiplier,
-            "method": method,
-        }
-
-    if not group_cols:
-        e = float(df[event_col].sum())
-        d = float(df[denom_col].sum())
-        r = _compute_row(e, d)
-        return pl.DataFrame([{
-            "events": e, "denominator": d,
-            **r, "multiplier": multiplier, "confidence": confidence,
-            "notes": _crude_rate_notes(e, d, used_end_of_period_denom),
-            "significance": "Not tested",
-        }])
-
-    grouped = (
-        df.group_by(group_cols)
-        .agg([pl.col(event_col).sum().alias("events"), pl.col(denom_col).sum().alias("denominator")])
-        .sort(group_cols)
-    )
-
-    overall_e = float(df[event_col].sum())
-    overall_d = float(df[denom_col].sum())
-    overall_rate = np.nan if overall_d == 0 else (overall_e / overall_d) * multiplier
+        return events / denominator * multiplier, low / denominator * multiplier, high / denominator * multiplier, method
 
     records = []
-    for row in grouped.iter_rows(named=True):
-        e, d = float(row["events"]), float(row["denominator"])
-        r = _compute_row(e, d)
+    for key, data, is_reference in _iter_group_slices(df, dimensions, sets, all_label):
+        events = float(data[event_col].sum())
+        denominator = float(data[_DENOM_COL].sum())
+        estimate, lower, upper, method = calculate(events, denominator)
         records.append({
-            **{c: row[c] for c in group_cols},
-            "events": e, "denominator": d,
-            **r, "multiplier": multiplier, "confidence": confidence,
-            "notes": _crude_rate_notes(e, d, used_end_of_period_denom),
-            "significance": _significance_from_ci(overall_rate, r["lower"], r["upper"]),
+            **key, "events": events, "denominator": denominator, "rate": estimate,
+            "lower": lower, "upper": upper, "multiplier": multiplier,
+            "confidence": confidence, "method": method,
+            "notes": _crude_rate_notes(events, denominator, True),
+            "significance": "Reference" if is_reference else _significance_from_ci(reference, lower, upper),
         })
-
-    r_overall = _compute_row(overall_e, overall_d)
-    records.append({
-        **{c: "Overall" for c in group_cols},
-        "events": overall_e, "denominator": overall_d,
-        **r_overall, "multiplier": multiplier, "confidence": confidence,
-        "notes": _crude_rate_notes(overall_e, overall_d, used_end_of_period_denom),
-        "significance": "Reference",
-    })
     return pl.from_dicts(records)
 
 
@@ -770,157 +840,66 @@ def directly_standardized_proportion_df(
     df: pl.DataFrame,
     event_col: str,
     strata_cols: Sequence[str],
-    group_cols: Sequence[str],
+    inequalities_cols: Sequence[str] | None = None,
+    organisational_cols: Mapping[str, Sequence[str]] | None = None,
+    *,
+    organisational_mode: Literal["separate", "cross"] = "separate",
+    all_label: str = "All",
     confidence: float = 0.95,
 ) -> pl.DataFrame:
-    """
-    Compute directly standardised proportions (DSP) with Wilson-Dobson CIs.
-
-    Reference weights are derived from the full dataset.  Numeric strata columns
-    are automatically binned into quartile categories.  The Wilson-Dobson method
-    produces asymmetric CIs that naturally approach the [0, 1] boundary.
-
-    Parameters
-    ----------
-    df : pl.DataFrame
-        Input dataset.
-    event_col : str
-        Binary event indicator (0/1 or boolean).
-    strata_cols : Sequence[str]
-        Standardisation strata (numeric strata auto-binned to quartiles).
-    group_cols : Sequence[str]
-        Grouping columns.  One output row per unique combination.
-    confidence : float, default 0.95
-        Confidence level.
-
-    Returns
-    -------
-    pl.DataFrame
-        Columns: [*group_cols, events, n, dsp, dsp_lower, dsp_upper, notes,
-                  significance]
-        An additional "Overall" row is appended (group_cols set to "Overall")
-        giving the crude (unstandardised) proportion across the full input
-        dataset, with its own Wilson-Dobson CI. Because this row IS the
-        reference population used to build the standardisation weights, it
-        requires no weighting -- this is stated explicitly in its notes.
-        Each non-Overall row's significance is assessed by checking whether
-        the fixed Overall proportion falls inside or outside that row's own
-        dsp_lower/dsp_upper interval -- no formal hypothesis test is
-        performed. The Overall row itself is always labelled "Reference".
-
-    Notes
-    -----
-    notes flags:
-        "Haldane correction applied"              - boundary stratum (0% or 100%) detected.
-        "Zero events"                             - group has no events.
-        "Low event count (<10)"                   - raw group events < 10.
-        "All events (proportion = 1)"             - all records are events.
-        "Low non-event count (<10)"               - group has fewer than 10 non-events.
-        "Unreliable: stratum n<10"                - non-empty stratum with < 10 records.
-        "Unreliable: stratum non-event count <10" - non-empty stratum with < 10 non-events.
-        "Overall proportion: no weighting applied as this row is itself the
-         reference population"                    - appears only on the "Overall" row.
-    """
-    strata_cols = list(strata_cols)
-    group_cols = list(group_cols)
-    df = _cast_group_cols_to_utf8(df, group_cols)
-
-    work_df = _prepare_dataframe_proportion(df, event_col, strata_cols, group_cols)
-    ref_weights = _build_reference_weights(work_df, strata_cols)
-    all_strata = ref_weights.select(strata_cols)
-    group_combinations = work_df.select(group_cols).unique(maintain_order=True)
-
-    overall_events = float(work_df[event_col].sum())
-    overall_n = float(len(work_df))
-    overall_proportion = overall_events / overall_n if overall_n > 0 else np.nan
-
-    records = []
-    for row in group_combinations.iter_rows(named=True):
-        group_data = _filter_group(work_df, row)
-        crude_events = float(group_data[event_col].sum())
-        crude_n = float(len(group_data))
-
-        s = _compute_proportion_stratum_stats(
-            group_data, all_strata, event_col, strata_cols, ref_weights
-        )
-        dsp = float(np.sum(s["stratum_weights"] * s["stratum_props"]))
-        dsp_lower, dsp_upper, _ = _wilson_dobson_proportion_ci(
-            dsp, crude_events, crude_n,
-            s["stratum_weights"], s["stratum_props"], s["stratum_ns"], confidence,
-        )
-
-        crude_non_events = crude_n - crude_events
-        notes = []
-        if s["haldane_applied"]:
-            notes.append("Haldane correction applied")
-        if crude_events == 0:
-            notes.append("Zero events")
-        elif crude_events < 10:
-            notes.append("Low event count (<10)")
-        if crude_non_events == 0:
-            notes.append("All events (proportion = 1)")
-        elif crude_non_events < 10:
-            notes.append("Low non-event count (<10)")
-        has_unreliable_stratum = any(0 < v < 10 for v in s["raw_stratum_ns"])
-        if has_unreliable_stratum:
-            notes.append("Unreliable: stratum n<10")
-        raw_non_events = [
-            float(n_i) - float(e_i)
-            for n_i, e_i in zip(s["raw_stratum_ns"], s["raw_stratum_events"])
-            if float(n_i) > 0
-        ]
-        has_unreliable_non_events = any(0 < v < 10 for v in raw_non_events)
-        if has_unreliable_non_events:
-            notes.append("Unreliable: stratum non-event count <10")
-
-        records.append({
-            **row,
-            "events": int(crude_events), "n": int(crude_n),
-            "dsp": round(dsp, 6),
-            "dsp_lower": round(dsp_lower, 6),
-            "dsp_upper": round(dsp_upper, 6),
-            "notes": " | ".join(notes),
-            "significance": _significance_from_ci(overall_proportion, dsp_lower, dsp_upper),
-        })
-
-    o_lo, o_hi, _ = _wilson_dobson_proportion_ci(
-        overall_proportion,
-        overall_events, overall_n,
-        np.array([1.0]), np.array([overall_proportion]),
-        np.array([overall_n]), confidence,
-    ) if overall_n > 0 else (np.nan, np.nan, np.nan)
-    overall_non_events = overall_n - overall_events
-
-    overall_notes = []
-    if overall_events == 0:
-        overall_notes.append("Zero events")
-    elif overall_events < 10:
-        overall_notes.append("Low event count (<10)")
-    if overall_non_events == 0:
-        overall_notes.append("All events (proportion = 1)")
-    elif overall_non_events < 10:
-        overall_notes.append("Low non-event count (<10)")
-    overall_notes.append(
-        "Overall proportion: no weighting applied as this row is itself the reference population"
+    """DSPs over hierarchy roll-ups and the full inequality cube."""
+    _validate_options(confidence)
+    strata = list(strata_cols)
+    if not strata:
+        raise ValueError("strata_cols must contain at least one column.")
+    df, inequalities, hierarchies, dimensions = _prepare_dimensions(
+        df, event_col, strata, inequalities_cols, organisational_cols,
+        organisational_mode, all_label,
     )
-
-    records.append({
-        **{c: "Overall" for c in group_cols},
-        "events": int(overall_events), "n": int(overall_n),
-        "dsp": round(overall_proportion, 6) if np.isfinite(overall_proportion) else np.nan,
-        "dsp_lower": round(o_lo, 6) if np.isfinite(o_lo) else np.nan,
-        "dsp_upper": round(o_hi, 6) if np.isfinite(o_hi) else np.nan,
-        "notes": " | ".join(overall_notes),
-        "significance": "Reference",
-    })
-
-    if not records:
-        schema = {c: pl.Utf8 for c in group_cols}
-        schema.update({"events": pl.Int64, "n": pl.Int64,
-                        "dsp": pl.Float64, "dsp_lower": pl.Float64,
-                        "dsp_upper": pl.Float64, "notes": pl.Utf8,
-                        "significance": pl.Utf8})
-        return pl.DataFrame(schema=schema)
+    work = _prepare_dataframe_proportion(df, event_col, strata, dimensions)
+    sets = _build_grouping_sets(inequalities, hierarchies, organisational_mode)
+    weights = _build_reference_weights(work, strata)
+    all_strata = weights.select(strata)
+    overall_e, overall_n = float(work[event_col].sum()), float(len(work))
+    reference = overall_e / overall_n if overall_n else np.nan
+    records = []
+    for key, data, is_reference in _iter_group_slices(work, dimensions, sets, all_label):
+        events, n = float(data[event_col].sum()), float(len(data))
+        notes = []
+        if is_reference:
+            estimate = reference
+            lower, upper, _ = _wilson_dobson_proportion_ci(
+                reference, overall_e, overall_n, np.array([1.0]),
+                np.array([reference]), np.array([overall_n]), confidence,
+            ) if overall_n else (np.nan, np.nan, np.nan)
+            notes.append("Overall proportion: no weighting applied as this row is itself the reference population")
+        else:
+            s = _compute_proportion_stratum_stats(data, all_strata, event_col, strata, weights)
+            estimate = float(np.sum(s["stratum_weights"] * s["stratum_props"]))
+            lower, upper, _ = _wilson_dobson_proportion_ci(
+                estimate, events, n, s["stratum_weights"], s["stratum_props"],
+                s["stratum_ns"], confidence,
+            )
+            if s["haldane_applied"]:
+                notes.append("Haldane correction applied")
+            if any(0 < x < 10 for x in s["raw_stratum_ns"]):
+                notes.append("Unreliable: stratum n<10")
+            non_events = [float(ni) - float(ei) for ni, ei in zip(s["raw_stratum_ns"], s["raw_stratum_events"]) if ni > 0]
+            if any(0 < x < 10 for x in non_events):
+                notes.append("Unreliable: stratum non-event count <10")
+        non_events = n - events
+        if events == 0: notes.append("Zero events")
+        elif events < 10: notes.append("Low event count (<10)")
+        if non_events == 0: notes.append("All events (proportion = 1)")
+        elif non_events < 10: notes.append("Low non-event count (<10)")
+        records.append({
+            **key, "events": int(events), "n": int(n),
+            "dsp": round(estimate, 6) if np.isfinite(estimate) else np.nan,
+            "dsp_lower": round(lower, 6) if np.isfinite(lower) else np.nan,
+            "dsp_upper": round(upper, 6) if np.isfinite(upper) else np.nan,
+            "notes": " | ".join(notes),
+            "significance": "Reference" if is_reference else _significance_from_ci(reference, lower, upper),
+        })
     return pl.from_dicts(records)
 
 
@@ -928,186 +907,61 @@ def directly_standardized_rate_df(
     df: pl.DataFrame,
     event_col: str,
     strata_cols: Sequence[str],
-    group_cols: Sequence[str],
+    inequalities_cols: Sequence[str] | None = None,
+    organisational_cols: Mapping[str, Sequence[str]] | None = None,
+    *,
+    organisational_mode: Literal["separate", "cross"] = "separate",
+    all_label: str = "All",
     multiplier: float = 100_000.0,
     confidence: float = 0.95,
 ) -> pl.DataFrame:
-    """
-    Compute directly standardised rates (DSR) with Dobson-Byar CIs.
-
-    Reference weights are derived from the full dataset.  Numeric strata columns
-    are automatically binned into quartile categories.
-
-    The denominator (exposure) is ALWAYS inferred from row count within each
-    stratum/group combination: one row = one unit of exposure, interpreted
-    as the population/headcount at the END of the reporting period. This is
-    the only supported denominator method in this module -- a simplifying
-    assumption for patient-level dataframes where true person-time is
-    unavailable: patients who did not experience the full exposure period
-    are still counted as a full unit. Flagged explicitly via the
-    "End-of-period denominator" entry in notes on every row.
-
-    Parameters
-    ----------
-    df : pl.DataFrame
-        Input dataset. One row is assumed to represent one unit of exposure.
-    event_col : str
-        Column containing observed event counts.
-    strata_cols : Sequence[str]
-        Standardisation strata (numeric strata auto-binned to quartiles).
-    group_cols : Sequence[str]
-        Grouping columns.  One output row per unique combination.
-    multiplier : float, default 100_000
-        Rate scaling factor.
-    confidence : float, default 0.95
-        Confidence level.
-
-    Returns
-    -------
-    pl.DataFrame
-        Columns: [*group_cols, events, denominator, dsr, dsr_lower, dsr_upper,
-                  multiplier, notes, significance]
-        An additional "Overall" row is appended (group_cols set to "Overall")
-        giving the crude (unstandardised) rate across the full input dataset,
-        with its own Dobson-Byar/exact CI. Because this row IS the reference
-        population used to build the standardisation weights, it requires no
-        weighting -- this is stated explicitly in its notes.
-        Each non-Overall row's significance is assessed by checking whether
-        the fixed Overall rate falls inside or outside that row's own
-        dsr_lower/dsr_upper interval -- no formal hypothesis test is
-        performed. The Overall row itself is always labelled "Reference".
-
-    Notes
-    -----
-    notes flags:
-        "End-of-period denominator: row count used as exposure"
-                                                               - appears on every row.
-        "Haldane correction applied"                          - zero-event non-empty stratum.
-        "Zero events"                                         - group has no events.
-        "Low event count (<10): DSR should generally not be reported"
-        "Zero denominator"                                    - group denominator is zero.
-        "Unreliable: stratum denominator <10"                 - non-empty stratum denominator < 10.
-        "Overall rate: no weighting applied as this row is itself the
-         reference population"                                - appears only on the "Overall" row.
-    """
-    strata_cols = list(strata_cols)
-    group_cols = list(group_cols)
-    df = _cast_group_cols_to_utf8(df, group_cols)
-
-    work_df = _add_end_of_period_denominator(df)
-    denom_col = _DENOM_COL
-    used_end_of_period_denom = True
-    work_df = _prepare_dataframe_rate(work_df, event_col, strata_cols, group_cols)
-    ref_weights = _build_reference_weights(work_df, strata_cols)
-    all_strata = ref_weights.select(strata_cols)
-    group_combinations = work_df.select(group_cols).unique(maintain_order=True)
-
-    overall_events = float(work_df[event_col].sum())
-    overall_denom = float(work_df[denom_col].sum())
-    overall_rate_u = overall_events / overall_denom if overall_denom > 0 else np.nan
-
-    def _scale(v):
-        return round(v * multiplier, 6) if np.isfinite(v) else np.nan
-
-    records = []
-    for row in group_combinations.iter_rows(named=True):
-        group_data = _filter_group(work_df, row)
-        crude_events = float(group_data[event_col].sum())
-        crude_denom = float(group_data[denom_col].sum())
-
-        s = _compute_rate_stratum_stats(
-            group_data, all_strata, event_col, denom_col, strata_cols, ref_weights
-        )
-        w_sum = float(np.sum(s["stratum_weights"]))
-        dsr_u = (
-            float(np.sum(s["stratum_weights"] * s["stratum_rates"]) / w_sum)
-            if w_sum > 0 else np.nan
-        )
-        lo_u, hi_u, _ = _dobson_byar_rate_ci(
-            dsr_u, crude_events,
-            s["stratum_weights"], s["stratum_events"], s["stratum_denoms"], confidence,
-        )
-
-        notes = []
-        if used_end_of_period_denom:
-            notes.append(
-                "End-of-period denominator: row count used as exposure "
-                "(assumes each row = 1 patient present at period end; "
-                "does not account for partial-period exposure)"
-            )
-        if s["haldane_applied"]:
-            notes.append("Haldane correction applied")
-        if crude_events == 0:
-            notes.append("Zero events")
-        elif crude_events < 10:
-            notes.append("Low event count (<10): DSR should generally not be reported")
-        if crude_denom == 0:
-            notes.append("Zero denominator")
-        has_unreliable_stratum = any(0 < v < 10 for v in s["raw_stratum_denoms"])
-        if has_unreliable_stratum:
-            notes.append("Unreliable: stratum denominator <10")
-
-        dsr_scaled = _scale(dsr_u)
-        lo_scaled = _scale(lo_u)
-        hi_scaled = _scale(hi_u)
-        records.append({
-            **row,
-            "events": int(crude_events), "denominator": round(crude_denom, 6),
-            "dsr": dsr_scaled,
-            "dsr_lower": lo_scaled,
-            "dsr_upper": hi_scaled,
-            "multiplier": multiplier,
-            "notes": " | ".join(notes),
-            "significance": _significance_from_ci(
-                overall_rate_u * multiplier if np.isfinite(overall_rate_u) else np.nan,
-                lo_scaled, hi_scaled,
-            ),
-        })
-
-    if overall_denom == 0:
-        o_lo_u, o_hi_u = np.nan, np.nan
-    else:
-        if overall_events < 10:
-            cnt_lo, cnt_hi = _exact_poisson_count_ci(overall_events, confidence)
-        else:
-            cnt_lo, cnt_hi = _byar_count_ci(overall_events, confidence)
-        o_lo_u = cnt_lo / overall_denom
-        o_hi_u = cnt_hi / overall_denom
-
-    overall_notes = []
-    if used_end_of_period_denom:
-        overall_notes.append(
-            "End-of-period denominator: row count used as exposure "
-            "(assumes each row = 1 patient present at period end; "
-            "does not account for partial-period exposure)"
-        )
-    if overall_events == 0:
-        overall_notes.append("Zero events")
-    elif overall_events < 10:
-        overall_notes.append("Low event count (<10): DSR should generally not be reported")
-    if overall_denom == 0:
-        overall_notes.append("Zero denominator")
-    overall_notes.append(
-        "Overall rate: no weighting applied as this row is itself the reference population"
+    """DSRs over hierarchy roll-ups and the full inequality cube."""
+    _validate_options(confidence, multiplier)
+    strata = list(strata_cols)
+    if not strata:
+        raise ValueError("strata_cols must contain at least one column.")
+    df, inequalities, hierarchies, dimensions = _prepare_dimensions(
+        df, event_col, strata, inequalities_cols, organisational_cols,
+        organisational_mode, all_label,
     )
-
-    overall_rate_scaled = _scale(overall_rate_u)
-    records.append({
-        **{c: "Overall" for c in group_cols},
-        "events": int(overall_events), "denominator": round(overall_denom, 6),
-        "dsr": overall_rate_scaled,
-        "dsr_lower": _scale(o_lo_u),
-        "dsr_upper": _scale(o_hi_u),
-        "multiplier": multiplier,
-        "notes": " | ".join(overall_notes),
-        "significance": "Reference",
-    })
-
-    if not records:
-        schema = {c: pl.Utf8 for c in group_cols}
-        schema.update({"events": pl.Int64, "denominator": pl.Float64,
-                        "dsr": pl.Float64, "dsr_lower": pl.Float64,
-                        "dsr_upper": pl.Float64, "multiplier": pl.Float64,
-                        "notes": pl.Utf8, "significance": pl.Utf8})
-        return pl.DataFrame(schema=schema)
+    work = _add_end_of_period_denominator(df)
+    work = _prepare_dataframe_rate(work, event_col, strata, dimensions)
+    sets = _build_grouping_sets(inequalities, hierarchies, organisational_mode)
+    weights = _build_reference_weights(work, strata)
+    all_strata = weights.select(strata)
+    overall_e, overall_d = float(work[event_col].sum()), float(work[_DENOM_COL].sum())
+    reference_u = overall_e / overall_d if overall_d else np.nan
+    scale = lambda x: round(x * multiplier, 6) if np.isfinite(x) else np.nan
+    records = []
+    for key, data, is_reference in _iter_group_slices(work, dimensions, sets, all_label):
+        events, denominator = float(data[event_col].sum()), float(data[_DENOM_COL].sum())
+        notes = ["End-of-period denominator: row count used as exposure (assumes each row = 1 patient present at period end; does not account for partial-period exposure)"]
+        if is_reference:
+            estimate_u = reference_u
+            if denominator:
+                low_count, high_count = (_exact_poisson_count_ci(events, confidence) if events < 10 else _byar_count_ci(events, confidence))
+                lower_u, upper_u = low_count / denominator, high_count / denominator
+            else:
+                lower_u = upper_u = np.nan
+            notes.append("Overall rate: no weighting applied as this row is itself the reference population")
+        else:
+            s = _compute_rate_stratum_stats(data, all_strata, event_col, _DENOM_COL, strata, weights)
+            weight_sum = float(np.sum(s["stratum_weights"]))
+            estimate_u = float(np.sum(s["stratum_weights"] * s["stratum_rates"]) / weight_sum) if weight_sum else np.nan
+            lower_u, upper_u, _ = _dobson_byar_rate_ci(
+                estimate_u, events, s["stratum_weights"], s["stratum_events"],
+                s["stratum_denoms"], confidence,
+            )
+            if s["haldane_applied"]: notes.append("Haldane correction applied")
+            if any(0 < x < 10 for x in s["raw_stratum_denoms"]): notes.append("Unreliable: stratum denominator <10")
+        if events == 0: notes.append("Zero events")
+        elif events < 10: notes.append("Low event count (<10): DSR should generally not be reported")
+        if denominator == 0: notes.append("Zero denominator")
+        estimate, lower, upper = scale(estimate_u), scale(lower_u), scale(upper_u)
+        records.append({
+            **key, "events": int(events), "denominator": round(denominator, 6),
+            "dsr": estimate, "dsr_lower": lower, "dsr_upper": upper,
+            "multiplier": multiplier, "notes": " | ".join(notes),
+            "significance": "Reference" if is_reference else _significance_from_ci(scale(reference_u), lower, upper),
+        })
     return pl.from_dicts(records)
