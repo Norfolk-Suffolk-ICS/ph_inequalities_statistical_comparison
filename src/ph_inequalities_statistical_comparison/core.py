@@ -721,6 +721,8 @@ def _crude_rate_notes(events: float, denominator: float, end_of_period_denom: bo
     if denominator < 40:
         notes.append("Low sample size - must flag that rate is unstable")
 
+    return " | ".join(notes)
+
 
 
 # ===========================================================================
