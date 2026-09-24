@@ -722,6 +722,7 @@ def _crude_rate_notes(events: float, denominator: float, end_of_period_denom: bo
         notes.append("Low sample size - must flag that rate is unstable")
 
 
+
 # ===========================================================================
 # Significance assessment vs the overall/population reference
 # ===========================================================================
