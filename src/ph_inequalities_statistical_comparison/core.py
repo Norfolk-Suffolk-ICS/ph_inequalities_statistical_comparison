@@ -1218,61 +1218,98 @@ def _exact_poisson_count_ci(
 # ===========================================================================
 
 
-def _haldane_proportion_correction(
-    events: float,
-    n: float,
-) -> tuple[float, float, float]:
-    """Apply a Haldane-Anscombe correction to a proportion."""
-    corrected_events = events + 0.5
-    corrected_n = n + 1.0
-
-    return (
-        float(
-            corrected_events / corrected_n,
-        ),
-        float(corrected_events),
-        float(corrected_n),
-    )
-
-
-def _wilson_dobson_proportion_ci(
-    dsp: float,
-    crude_events: float,
-    crude_n: float,
+def _mover_weighted_proportion_ci(
     stratum_weights: np.ndarray,
-    stratum_props: np.ndarray,
+    stratum_events: np.ndarray,
     stratum_ns: np.ndarray,
     confidence: float = 0.95,
 ) -> tuple[float, float, float]:
     """
-    Calculate a Wilson-Dobson interval for a standardised proportion.
+    Calculate a MOVER interval for a weighted sum of proportions.
 
-    The supplied stratum proportions and denominators determine the DSP
-    variance. The crude Wilson interval supplies the interval shape.
+    The supplied weights must correspond to mutually exclusive strata.
+    They are normalised internally over positively weighted, observed
+    strata.
+
+    Each stratum contributes its uncorrected observed proportion and its
+    Wilson score confidence interval. For independent strata, the recovered
+    lower- and upper-side variances are combined as weighted sums of squared
+    distances from the stratum estimates to their confidence limits.
+
+    Returns
+    -------
+    tuple[float, float, float]
+        Weighted estimate, lower confidence limit, and upper confidence
+        limit.
     """
-    if (
-        crude_n <= 0
-        or not np.isfinite(dsp)
+    arrays = (
+        stratum_weights,
+        stratum_events,
+        stratum_ns,
+    )
+
+    if any(
+        array.ndim != 1
+        for array in arrays
     ):
+        raise ValueError(
+            "MOVER inputs must be one-dimensional arrays."
+        )
+
+    lengths = {
+        len(array)
+        for array in arrays
+    }
+
+    if len(lengths) != 1:
+        raise ValueError(
+            "MOVER weights, events, and denominators must have equal "
+            "lengths."
+        )
+
+    valid = (
+        np.isfinite(stratum_weights)
+        & np.isfinite(stratum_events)
+        & np.isfinite(stratum_ns)
+        & (stratum_weights > 0)
+        & (stratum_ns > 0)
+    )
+
+    if not np.any(valid):
         return (
             np.nan,
             np.nan,
             np.nan,
         )
 
-    valid = stratum_ns > 0
+    weights = (
+        stratum_weights[valid]
+        .astype(float)
+    )
 
-    weights = stratum_weights[valid]
-    proportions = stratum_props[valid]
-    denominators = stratum_ns[valid]
+    events = (
+        stratum_events[valid]
+        .astype(float)
+    )
+
+    denominators = (
+        stratum_ns[valid]
+        .astype(float)
+    )
+
+    if np.any(events < 0) or np.any(events > denominators):
+        raise ValueError(
+            "MOVER stratum events must be between zero and the "
+            "corresponding stratum denominator."
+        )
 
     weight_sum = float(
-        np.sum(stratum_weights),
+        np.sum(weights),
     )
 
     if (
-        weight_sum == 0
-        or len(weights) == 0
+        not np.isfinite(weight_sum)
+        or weight_sum <= 0
     ):
         return (
             np.nan,
@@ -1280,97 +1317,87 @@ def _wilson_dobson_proportion_ci(
             np.nan,
         )
 
-    variance_dsp = float(
-        np.sum(
-            weights**2
-            * proportions
-            * (1 - proportions)
-            / denominators,
-        )
-        / weight_sum**2,
+    weights = weights / weight_sum
+
+    proportions = (
+        events / denominators
     )
 
-    crude_proportion = (
-        crude_events / crude_n
+    lower_limits = np.empty(
+        len(proportions),
+        dtype=float,
     )
 
-    (
-        crude_lower,
-        crude_upper,
-        variance_crude,
-    ) = _wilson_proportion_ci(
-        crude_events,
-        crude_n,
-        confidence,
+    upper_limits = np.empty(
+        len(proportions),
+        dtype=float,
     )
 
-    if (
-        variance_crude == 0
-        or not np.isfinite(variance_crude)
+    for index, (
+        stratum_events_value,
+        stratum_n,
+    ) in enumerate(
+        zip(
+            events,
+            denominators,
+        ),
     ):
         (
-            corrected_proportion,
+            lower_limits[index],
+            upper_limits[index],
             _,
-            corrected_n,
-        ) = _haldane_proportion_correction(
-            crude_events,
-            crude_n,
+        ) = _wilson_proportion_ci(
+            events=stratum_events_value,
+            n=stratum_n,
+            confidence=confidence,
         )
 
-        variance_crude = (
-            corrected_proportion
-            * (1 - corrected_proportion)
-            / corrected_n
-        )
-
-    if (
-        variance_crude == 0
-        or not np.isfinite(variance_crude)
-    ):
-        return (
-            float(dsp),
-            float(dsp),
-            variance_dsp,
-        )
-
-    scale = float(
-        np.sqrt(
-            variance_dsp / variance_crude,
+    estimate = float(
+        np.sum(
+            weights * proportions,
         ),
     )
 
-    lower = (
-        dsp
-        + scale
-        * (
-            crude_lower
-            - crude_proportion
-        )
+    lower_distance = float(
+        np.sqrt(
+            np.sum(
+                weights**2
+                * (
+                    proportions
+                    - lower_limits
+                )
+                ** 2,
+            ),
+        ),
     )
 
-    upper = (
-        dsp
-        + scale
-        * (
-            crude_upper
-            - crude_proportion
-        )
+    upper_distance = float(
+        np.sqrt(
+            np.sum(
+                weights**2
+                * (
+                    upper_limits
+                    - proportions
+                )
+                ** 2,
+            ),
+        ),
+    )
+
+    lower = max(
+        0.0,
+        estimate - lower_distance,
+    )
+
+    upper = min(
+        1.0,
+        estimate + upper_distance,
     )
 
     return (
-        float(
-            max(
-                lower,
-                0.0,
-            ),
-        ),
-        float(
-            min(
-                upper,
-                1.0,
-            ),
-        ),
-        variance_dsp,
+        estimate,
+        float(lower),
+        float(upper),
     )
 
 
@@ -1380,12 +1407,19 @@ def _compute_proportion_stratum_stats(
     event_col: str,
     strata_cols: list[str],
     reference_weights: pl.DataFrame,
+    confidence: float = 0.95,
 ) -> dict[str, object]:
     """
-    Calculate proportion statistics across the standardisation strata.
+    Calculate a DSP and MOVER interval across standardisation strata.
 
-    Boundary strata currently receive the existing Haldane correction.
-    Empty positively weighted strata remain represented with n=0.
+    Observed strata use their uncorrected observed proportions. Where a
+    positively weighted standard stratum is absent from the group, that
+    stratum is excluded and the remaining reference weights are
+    renormalised to sum to one.
+
+    Renormalisation changes the target population to the subset of the
+    reference population supported by the group. Metadata describing the
+    omitted strata and omitted reference weight is returned for reporting.
     """
     aggregation = (
         group_data.group_by(strata_cols)
@@ -1436,58 +1470,101 @@ def _compute_proportion_stratum_stats(
         .astype(float)
     )
 
-    weights = (
+    reference_weight_values = (
         scaffold["ref_weight"]
         .to_numpy()
         .astype(float)
     )
 
-    proportions = np.zeros(
-        len(raw_events),
+    observed_mask = (
+        (raw_ns > 0)
+        & (reference_weight_values > 0)
     )
 
-    haldane_applied = False
+    missing_mask = (
+        (raw_ns == 0)
+        & (reference_weight_values > 0)
+    )
 
-    for index, (
-        events,
-        denominator,
-    ) in enumerate(
-        zip(
-            raw_events,
-            raw_ns,
+    observed_reference_weight = float(
+        np.sum(
+            reference_weight_values[
+                observed_mask
+            ],
         ),
-    ):
-        if denominator == 0:
-            proportions[index] = 0.0
+    )
 
-        elif (
-            events == 0
-            or events == denominator
-        ):
-            (
-                corrected_proportion,
-                _,
-                _,
-            ) = _haldane_proportion_correction(
-                events,
-                denominator,
-            )
+    missing_reference_weight = float(
+        np.sum(
+            reference_weight_values[
+                missing_mask
+            ],
+        ),
+    )
 
-            proportions[index] = corrected_proportion
-            haldane_applied = True
+    missing_strata_count = int(
+        np.sum(
+            missing_mask,
+        ),
+    )
 
-        else:
-            proportions[index] = (
-                events / denominator
-            )
+    normalised_weights = np.zeros_like(
+        reference_weight_values,
+        dtype=float,
+    )
+
+    if observed_reference_weight > 0:
+        normalised_weights[
+            observed_mask
+        ] = (
+            reference_weight_values[
+                observed_mask
+            ]
+            / observed_reference_weight
+        )
+
+    (
+        estimate,
+        lower,
+        upper,
+    ) = _mover_weighted_proportion_ci(
+        stratum_weights=normalised_weights,
+        stratum_events=raw_events,
+        stratum_ns=raw_ns,
+        confidence=confidence,
+    )
+
+    stratum_proportions = np.full(
+        len(raw_events),
+        np.nan,
+        dtype=float,
+    )
+
+    stratum_proportions[
+        observed_mask
+    ] = (
+        raw_events[
+            observed_mask
+        ]
+        / raw_ns[
+            observed_mask
+        ]
+    )
 
     return {
-        "stratum_props": proportions,
+        "dsp": estimate,
+        "dsp_lower": lower,
+        "dsp_upper": upper,
+        "stratum_props": stratum_proportions,
         "stratum_ns": raw_ns,
-        "stratum_weights": weights,
+        "stratum_events": raw_events,
+        "reference_weights": reference_weight_values,
+        "normalised_weights": normalised_weights,
         "raw_stratum_ns": raw_ns,
         "raw_stratum_events": raw_events,
-        "haldane_applied": haldane_applied,
+        "missing_strata_count": missing_strata_count,
+        "missing_reference_weight": missing_reference_weight,
+        "observed_reference_weight": observed_reference_weight,
     }
 
 
@@ -2197,7 +2274,18 @@ def directly_standardized_proportion_df(
     all_label: str = "All",
     confidence: float = 0.95,
 ) -> pl.DataFrame:
-    """Calculate DSPs across configured grouping sets."""
+    """
+    Calculate directly standardised proportions using MOVER intervals.
+
+    Stratum-specific point estimates are the uncorrected observed
+    proportions. Wilson score intervals are calculated within each stratum
+    and combined using the Method of Variance Estimates Recovery.
+
+    Where a group has no observations in a positively weighted reference
+    stratum, that stratum is omitted and the remaining reference weights
+    are renormalised to sum to one. The omission and omitted reference
+    weight are recorded in the notes column.
+    """
     _validate_options(
         confidence,
     )
@@ -2258,18 +2346,19 @@ def directly_standardized_proportion_df(
         strata,
     )
 
-    overall_events = float(
-        work[event_col].sum(),
+    reference_statistics = (
+        _compute_proportion_stratum_stats(
+            group_data=work,
+            all_strata=all_strata,
+            event_col=event_col,
+            strata_cols=strata,
+            reference_weights=reference_weights,
+            confidence=confidence,
+        )
     )
 
-    overall_n = float(
-        len(work),
-    )
-
-    reference = (
-        overall_events / overall_n
-        if overall_n
-        else np.nan
+    reference = float(
+        reference_statistics["dsp"],
     )
 
     records: list[dict[str, object]] = []
@@ -2295,25 +2384,14 @@ def directly_standardized_proportion_df(
         notes: list[str] = []
 
         if is_reference:
-            estimate = reference
-
-            (
-                lower,
-                upper,
-                _,
-            ) = _wilson_dobson_proportion_ci(
-                dsp=reference,
-                crude_events=overall_events,
-                crude_n=overall_n,
-                stratum_weights=np.array([1.0]),
-                stratum_props=np.array([reference]),
-                stratum_ns=np.array([overall_n]),
-                confidence=confidence,
+            stratum_statistics = (
+                reference_statistics
             )
 
             notes.append(
-                "Overall proportion: no weighting applied because this "
-                "row is the reference population."
+                "Reference population: full standardisation weights "
+                "used; the standardised point estimate equals the "
+                "overall observed proportion."
             )
 
         else:
@@ -2324,75 +2402,91 @@ def directly_standardized_proportion_df(
                     event_col=event_col,
                     strata_cols=strata,
                     reference_weights=reference_weights,
+                    confidence=confidence,
                 )
             )
 
-            estimate = float(
-                np.sum(
-                    stratum_statistics["stratum_weights"]
-                    * stratum_statistics["stratum_props"],
-                ),
+        estimate = float(
+            stratum_statistics["dsp"],
+        )
+
+        lower = float(
+            stratum_statistics["dsp_lower"],
+        )
+
+        upper = float(
+            stratum_statistics["dsp_upper"],
+        )
+
+        missing_strata_count = int(
+            stratum_statistics[
+                "missing_strata_count"
+            ],
+        )
+
+        if missing_strata_count:
+            missing_reference_weight = float(
+                stratum_statistics[
+                    "missing_reference_weight"
+                ],
             )
 
-            (
-                lower,
-                upper,
-                _,
-            ) = _wilson_dobson_proportion_ci(
-                dsp=estimate,
-                crude_events=events,
-                crude_n=n,
-                stratum_weights=stratum_statistics[
-                    "stratum_weights"
+            observed_reference_weight = float(
+                stratum_statistics[
+                    "observed_reference_weight"
                 ],
-                stratum_props=stratum_statistics[
-                    "stratum_props"
-                ],
-                stratum_ns=stratum_statistics[
-                    "stratum_ns"
-                ],
-                confidence=confidence,
             )
 
-            if stratum_statistics["haldane_applied"]:
-                notes.append(
-                    "Haldane correction applied."
-                )
+            stratum_word = (
+                "stratum"
+                if missing_strata_count == 1
+                else "strata"
+            )
 
-            if any(
-                0 < denominator < 10
-                for denominator in stratum_statistics[
-                    "raw_stratum_ns"
-                ]
-            ):
-                notes.append(
-                    "Unreliable: stratum n < 10."
-                )
+            notes.append(
+                "Calculated with missing standardisation "
+                f"{stratum_word}: {missing_strata_count} "
+                f"{stratum_word} omitted, representing "
+                f"{missing_reference_weight:.1%} of the reference "
+                "population; the remaining reference weights "
+                f"({observed_reference_weight:.1%} coverage) were "
+                "renormalised to sum to 1."
+            )
 
-            non_events = [
-                float(denominator)
-                - float(stratum_events)
-                for (
-                    denominator,
-                    stratum_events,
-                ) in zip(
-                    stratum_statistics[
-                        "raw_stratum_ns"
-                    ],
-                    stratum_statistics[
-                        "raw_stratum_events"
-                    ],
-                )
-                if denominator > 0
+        if any(
+            0 < denominator < 10
+            for denominator in stratum_statistics[
+                "raw_stratum_ns"
             ]
+        ):
+            notes.append(
+                "Unreliable: stratum n < 10."
+            )
 
-            if any(
-                0 < count < 10
-                for count in non_events
-            ):
-                notes.append(
-                    "Unreliable: stratum non-event count < 10."
-                )
+        non_events_by_stratum = [
+            float(denominator)
+            - float(stratum_events)
+            for (
+                denominator,
+                stratum_events,
+            ) in zip(
+                stratum_statistics[
+                    "raw_stratum_ns"
+                ],
+                stratum_statistics[
+                    "raw_stratum_events"
+                ],
+            )
+            if denominator > 0
+        ]
+
+        if any(
+            0 < count < 10
+            for count in non_events_by_stratum
+        ):
+            notes.append(
+                "Unreliable: stratum non-event count < 10."
+            )
 
         non_events = n - events
 
