@@ -1,18 +1,5 @@
 """
-ph_inequalities_statistical_comparison.py
-=========================================
-Public health standardisation functions using UKHSA/OHID-recommended methods.
-
-Input validation
-----------------
-All four public functions validate their numerator, strata, inequality, and
-organisational columns before computation:
-
-- Null/NA and non-finite numeric values are rejected outright, with an
-  informative error listing every offending column and value type.
-- The numerator column must be a non-negative integer column or boolean.
-- For proportion functions, the numerator must contain only 0 or 1.
-- For rate functions, the numerator may contain any non-negative integer.
+Core public-health inequality and standardisation functions.
 
 Public API
 ----------
@@ -21,21 +8,29 @@ Public API
 - directly_standardized_proportion_df
 - directly_standardized_rate_df
 
-The overall/reference value is treated as a fixed benchmark when assigning
-the descriptive Higher, Lower, or Not significant labels. No formal
-hypothesis test or multiple-testing correction is performed.
+Methods
+-------
+- Crude proportions: Wilson score confidence intervals.
+- Crude rates: exact Poisson intervals below 10 events; Byar otherwise.
+- DSP: Wilson-MOVER using uncorrected stratum proportions.
+- DSR: Poisson-MOVER using uncorrected stratum rates.
 
-References
-----------
-UKHSA Fingertips technical guidance:
-https://fingertips.phe.org.uk/static-reports/public-health-technical-guidance
+For DSP and DSR, positively weighted reference strata that are absent from
+a subgroup are omitted and the remaining reference weights are renormalised.
+The omitted reference-population share is reported in the notes column.
 
-Dependencies: polars, numpy, scipy
+The overall reference is treated as a fixed benchmark when assigning
+descriptive Higher, Lower, or Not significant labels. These labels are not
+formal hypothesis tests and no multiple-testing correction is applied.
+
+Dependencies
+------------
+polars, numpy, scipy
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import combinations, pairwise, product
 from numbers import Real
@@ -105,7 +100,7 @@ _RESERVED_ANALYSIS_COLUMNS = frozenset(
 def _flatten_organisational_cols(
     organisational_cols: Mapping[str, Sequence[str]],
 ) -> list[str]:
-    """Flatten named organisational hierarchies in declaration order."""
+    """Flatten organisational hierarchies in declaration order."""
     return [
         col
         for levels in organisational_cols.values()
@@ -117,12 +112,7 @@ def _dimension_cols(
     inequalities_cols: Sequence[str],
     organisational_cols: Mapping[str, Sequence[str]],
 ) -> list[str]:
-    """
-    Return all output dimensions.
-
-    Organisational columns are placed first, followed by inequality columns,
-    matching the ordering used in output tables and grouping sets.
-    """
+    """Return organisational dimensions followed by inequalities."""
     return (
         _flatten_organisational_cols(organisational_cols)
         + list(inequalities_cols)
@@ -134,12 +124,7 @@ def _cast_dimension_cols_to_utf8(
     inequalities_cols: Sequence[str],
     organisational_cols: Mapping[str, Sequence[str]],
 ) -> pl.DataFrame:
-    """
-    Cast inequality and organisational dimensions to a common output dtype.
-
-    This permits the configured all_label string to be inserted into rolled-up
-    rows even where the original grouping column was numeric.
-    """
+    """Cast output dimensions to strings so they can contain all_label."""
     dimensions = _dimension_cols(
         inequalities_cols,
         organisational_cols,
@@ -157,7 +142,7 @@ def _cast_dimension_cols_to_utf8(
 def _bin_numeric_to_quartiles(
     series: pl.Series,
 ) -> pl.Series:
-    """Bin a finite numeric Polars Series into quartile labels Q1-Q4."""
+    """Bin a finite numeric series into quartile labels Q1-Q4."""
     q1 = series.quantile(
         0.25,
         interpolation="linear",
@@ -196,12 +181,28 @@ def _bin_numeric_to_quartiles(
     )
 
 
+def _bin_strata(
+    df: pl.DataFrame,
+    strata_cols: Sequence[str],
+) -> pl.DataFrame:
+    """Automatically bin numeric standardisation strata into quartiles."""
+    for col in strata_cols:
+        if df.schema[col] in _NUMERIC_DTYPES:
+            df = df.with_columns(
+                _bin_numeric_to_quartiles(
+                    df[col],
+                ).alias(col),
+            )
+
+    return df
+
+
 def _build_reference_weights(
     df: pl.DataFrame,
     strata_cols: list[str],
 ) -> pl.DataFrame:
     """Derive standard-population weights from the full input dataset."""
-    total = len(df)
+    total = df.height
 
     if total == 0:
         raise ValueError(
@@ -222,31 +223,11 @@ def _build_reference_weights(
     )
 
 
-def _bin_strata(
-    df: pl.DataFrame,
-    strata_cols: list[str],
-) -> pl.DataFrame:
-    """
-    Auto-bin numeric strata columns into quartiles.
-
-    Categorical strata are left unchanged.
-    """
-    for col in strata_cols:
-        if df.schema[col] in _NUMERIC_DTYPES:
-            df = df.with_columns(
-                _bin_numeric_to_quartiles(
-                    df[col],
-                ).alias(col),
-            )
-
-    return df
-
-
 def _check_columns(
     df: pl.DataFrame,
     cols: Sequence[str],
 ) -> None:
-    """Raise an error if required columns are absent."""
+    """Raise an error when required columns are absent."""
     missing = sorted(
         set(cols) - set(df.columns),
     )
@@ -282,12 +263,7 @@ def _check_no_missing_or_nonfinite(
     df: pl.DataFrame,
     cols: Sequence[str],
 ) -> None:
-    """
-    Reject null, NaN, and infinite values in analytical columns.
-
-    Polars treats NaN as distinct from null, so both conditions must be
-    checked explicitly for floating-point columns.
-    """
+    """Reject null, NaN, and infinite analytical values."""
     offending: dict[str, dict[str, int]] = {}
 
     for col in dict.fromkeys(cols):
@@ -350,19 +326,19 @@ def _validate_numerator_col(
     binary: bool,
 ) -> pl.DataFrame:
     """
-    Validate that event_col is a non-negative integer column.
+    Validate the event column.
 
-    Boolean columns are accepted and cast to Int64. Other non-integer
-    dtypes raise an error.
-
-    When binary=True, values must be exactly 0 or 1.
+    Boolean columns are accepted and converted to Int64. Other columns must
+    have an integer dtype and contain no negative values. Proportion
+    numerators must contain only 0 and 1.
     """
     dtype = df.schema[event_col]
 
     if dtype == pl.Boolean:
-        return df.with_columns(
+        df = df.with_columns(
             pl.col(event_col).cast(pl.Int64),
         )
+        dtype = pl.Int64
 
     if dtype not in _INTEGER_DTYPES:
         raise ValueError(
@@ -405,12 +381,7 @@ def _prepare_dataframe_proportion(
     inequalities_cols: Sequence[str],
     organisational_cols: Mapping[str, Sequence[str]],
 ) -> pl.DataFrame:
-    """
-    Validate and prepare inputs for directly standardised proportions.
-
-    The inequality/organisational distinction is preserved in the function
-    interface. The columns are flattened only for common validation.
-    """
+    """Validate and prepare directly standardised proportion inputs."""
     dimensions = _dimension_cols(
         inequalities_cols,
         organisational_cols,
@@ -444,7 +415,7 @@ def _prepare_dataframe_proportion(
 
     return _bin_strata(
         df,
-        list(strata_cols),
+        strata_cols,
     )
 
 
@@ -455,12 +426,7 @@ def _prepare_dataframe_rate(
     inequalities_cols: Sequence[str],
     organisational_cols: Mapping[str, Sequence[str]],
 ) -> pl.DataFrame:
-    """
-    Validate and prepare inputs for directly standardised rates.
-
-    The inequality/organisational distinction is preserved in the function
-    interface. The columns are flattened only for common validation.
-    """
+    """Validate and prepare directly standardised rate inputs."""
     dimensions = _dimension_cols(
         inequalities_cols,
         organisational_cols,
@@ -494,20 +460,14 @@ def _prepare_dataframe_rate(
 
     return _bin_strata(
         df,
-        list(strata_cols),
+        strata_cols,
     )
 
 
 def _add_end_of_period_denominator(
     df: pl.DataFrame,
 ) -> pl.DataFrame:
-    """
-    Add an internally derived denominator column containing ones.
-
-    Summing the column within a group is equivalent to counting rows. This
-    treats each row as one unit of exposure present at the end of the
-    reporting period.
-    """
+    """Add one unit of end-of-period exposure for every input row."""
     if _DENOM_COL in df.columns:
         raise ValueError(
             "The input dataframe already contains the reserved internal "
@@ -524,7 +484,7 @@ def _filter_group(
     df: pl.DataFrame,
     row: Mapping[str, object],
 ) -> pl.DataFrame:
-    """Filter a dataframe to the supplied active grouping values."""
+    """Filter a dataframe to the active grouping values."""
     mask = pl.lit(True)
 
     for col, value in row.items():
@@ -545,11 +505,7 @@ class _GroupingSet:
 def _normalise_hierarchies(
     organisational_cols: Mapping[str, Sequence[str]] | None,
 ) -> dict[str, tuple[str, ...]]:
-    """
-    Validate and normalise named organisational hierarchies.
-
-    Each hierarchy must be ordered from its highest to lowest level.
-    """
+    """Validate and normalise named organisational hierarchies."""
     if organisational_cols is None:
         return {}
 
@@ -620,15 +576,7 @@ def _prepare_dimensions(
     dict[str, tuple[str, ...]],
     list[str],
 ]:
-    """
-    Validate and prepare inequality and organisational dimensions.
-
-    Returns
-    -------
-    tuple
-        Prepared dataframe, inequality columns, organisational hierarchy
-        mapping, and flattened output dimensions.
-    """
+    """Validate and prepare inequality and organisational dimensions."""
     if not isinstance(df, pl.DataFrame):
         raise TypeError(
             "df must be a Polars DataFrame."
@@ -706,14 +654,15 @@ def _prepare_dimensions(
             f"{repeated}."
         )
 
-    inequality_organisational_overlap = sorted(
-        set(inequalities) & set(organisational),
+    overlap = sorted(
+        set(inequalities)
+        & set(organisational),
     )
 
-    if inequality_organisational_overlap:
+    if overlap:
         raise ValueError(
             "Columns cannot be both inequality and organisational: "
-            f"{inequality_organisational_overlap}."
+            f"{overlap}."
         )
 
     if (
@@ -750,14 +699,15 @@ def _prepare_dimensions(
         dimension_cols=dimensions,
     )
 
-    strata_dimension_overlap = sorted(
-        set(strata) & set(dimensions),
+    overlap = sorted(
+        set(strata)
+        & set(dimensions),
     )
 
-    if strata_dimension_overlap:
+    if overlap:
         raise ValueError(
             "Strata cannot also be inequality or organisational "
-            f"dimensions: {strata_dimension_overlap}."
+            f"dimensions: {overlap}."
         )
 
     if (
@@ -857,7 +807,7 @@ def _prepare_dimensions(
 def _inequality_states(
     cols: list[str],
 ) -> list[tuple[str, ...]]:
-    """Return the full marginal cube for inequality dimensions."""
+    """Return the complete marginal cube for inequality dimensions."""
     return [
         tuple(active)
         for size in range(
@@ -876,12 +826,7 @@ def _organisational_states(
     hierarchies: Mapping[str, tuple[str, ...]],
     mode: Literal["separate", "cross"],
 ) -> list[tuple[str, ...]]:
-    """
-    Return hierarchy-valid organisational grouping states.
-
-    In separate mode, each hierarchy is rolled up separately. In cross mode,
-    valid levels from separate hierarchies are crossed.
-    """
+    """Return hierarchy-valid organisational grouping states."""
     if not hierarchies:
         return [()]
 
@@ -928,7 +873,7 @@ def _build_grouping_sets(
     hierarchies: Mapping[str, tuple[str, ...]],
     mode: Literal["separate", "cross"],
 ) -> list[_GroupingSet]:
-    """Combine valid organisational states with the inequality cube."""
+    """Combine organisational states with the inequality cube."""
     candidates = [
         organisational_state + inequality_state
         for organisational_state in _organisational_states(
@@ -963,8 +908,14 @@ def _iter_group_slices(
     dimensions: list[str],
     grouping_sets: Sequence[_GroupingSet],
     all_label: str,
-):
-    """Yield display keys, data slices, and the reference-row flag."""
+) -> Iterator[
+    tuple[
+        dict[str, object],
+        pl.DataFrame,
+        bool,
+    ]
+]:
+    """Yield display keys, data slices, and reference-row indicators."""
     for grouping_set in grouping_sets:
         active = list(
             grouping_set.active_cols,
@@ -1015,7 +966,7 @@ def _validate_options(
     confidence: float,
     multiplier: float | None = None,
 ) -> None:
-    """Validate common statistical options with explicit type errors."""
+    """Validate confidence and multiplier options."""
     if (
         isinstance(confidence, bool)
         or not isinstance(confidence, Real)
@@ -1052,8 +1003,54 @@ def _validate_options(
         )
 
 
+def _validate_strata_cols(
+    strata_cols: Sequence[str],
+) -> list[str]:
+    """Validate the required standardisation strata argument."""
+    if (
+        isinstance(strata_cols, (str, bytes))
+        or not isinstance(strata_cols, Sequence)
+    ):
+        raise TypeError(
+            "strata_cols must be a sequence of column names, not a "
+            "single string."
+        )
+
+    strata = list(strata_cols)
+
+    if not strata:
+        raise ValueError(
+            "strata_cols must contain at least one column."
+        )
+
+    return strata
+
+
+def _missing_strata_note(
+    missing_strata_count: int,
+    missing_reference_weight: float,
+    observed_reference_weight: float,
+) -> str:
+    """Create a note describing missing-stratum renormalisation."""
+    stratum_word = (
+        "stratum"
+        if missing_strata_count == 1
+        else "strata"
+    )
+
+    return (
+        "Calculated with missing standardisation "
+        f"{stratum_word}: {missing_strata_count} "
+        f"{stratum_word} omitted, representing "
+        f"{missing_reference_weight:.1%} of the reference population; "
+        "the remaining reference weights "
+        f"({observed_reference_weight:.1%} coverage) were "
+        "renormalised to sum to 1."
+    )
+
+
 # ===========================================================================
-# Wilson score CI
+# Wilson score interval
 # ===========================================================================
 
 
@@ -1063,7 +1060,7 @@ def _wilson_proportion_ci(
     confidence: float = 0.95,
 ) -> tuple[float, float, float]:
     """Calculate a Wilson score interval for one proportion."""
-    if n == 0:
+    if n <= 0:
         return (
             np.nan,
             np.nan,
@@ -1122,7 +1119,7 @@ def _wilson_proportion_ci(
 
 
 # ===========================================================================
-# Byar and exact Poisson intervals
+# Poisson count intervals
 # ===========================================================================
 
 
@@ -1191,6 +1188,11 @@ def _exact_poisson_count_ci(
     confidence: float = 0.95,
 ) -> tuple[float, float]:
     """Calculate an exact chi-square Poisson count interval."""
+    if count < 0:
+        raise ValueError(
+            "count must be non-negative."
+        )
+
     alpha = 1.0 - confidence
 
     if count == 0:
@@ -1225,22 +1227,9 @@ def _mover_weighted_proportion_ci(
     confidence: float = 0.95,
 ) -> tuple[float, float, float]:
     """
-    Calculate a MOVER interval for a weighted sum of proportions.
+    Calculate a Wilson-MOVER interval for a weighted sum of proportions.
 
-    The supplied weights must correspond to mutually exclusive strata.
-    They are normalised internally over positively weighted, observed
-    strata.
-
-    Each stratum contributes its uncorrected observed proportion and its
-    Wilson score confidence interval. For independent strata, the recovered
-    lower- and upper-side variances are combined as weighted sums of squared
-    distances from the stratum estimates to their confidence limits.
-
-    Returns
-    -------
-    tuple[float, float, float]
-        Weighted estimate, lower confidence limit, and upper confidence
-        limit.
+    The point estimate uses uncorrected observed stratum proportions.
     """
     arrays = (
         stratum_weights,
@@ -1256,15 +1245,39 @@ def _mover_weighted_proportion_ci(
             "MOVER inputs must be one-dimensional arrays."
         )
 
-    lengths = {
-        len(array)
-        for array in arrays
-    }
-
-    if len(lengths) != 1:
+    if len(
+        {
+            len(array)
+            for array in arrays
+        },
+    ) != 1:
         raise ValueError(
             "MOVER weights, events, and denominators must have equal "
             "lengths."
+        )
+
+    if np.any(
+        np.isfinite(stratum_weights)
+        & (stratum_weights < 0)
+    ):
+        raise ValueError(
+            "MOVER stratum weights must be non-negative."
+        )
+
+    if np.any(
+        np.isfinite(stratum_events)
+        & (stratum_events < 0)
+    ):
+        raise ValueError(
+            "MOVER stratum events must be non-negative."
+        )
+
+    if np.any(
+        np.isfinite(stratum_ns)
+        & (stratum_ns < 0)
+    ):
+        raise ValueError(
+            "MOVER stratum denominators must be non-negative."
         )
 
     valid = (
@@ -1297,10 +1310,9 @@ def _mover_weighted_proportion_ci(
         .astype(float)
     )
 
-    if np.any(events < 0) or np.any(events > denominators):
+    if np.any(events > denominators):
         raise ValueError(
-            "MOVER stratum events must be between zero and the "
-            "corresponding stratum denominator."
+            "MOVER stratum events cannot exceed their denominators."
         )
 
     weight_sum = float(
@@ -1318,10 +1330,7 @@ def _mover_weighted_proportion_ci(
         )
 
     weights = weights / weight_sum
-
-    proportions = (
-        events / denominators
-    )
+    proportions = events / denominators
 
     lower_limits = np.empty(
         len(proportions),
@@ -1334,8 +1343,8 @@ def _mover_weighted_proportion_ci(
     )
 
     for index, (
-        stratum_events_value,
-        stratum_n,
+        count,
+        denominator,
     ) in enumerate(
         zip(
             events,
@@ -1347,8 +1356,8 @@ def _mover_weighted_proportion_ci(
             upper_limits[index],
             _,
         ) = _wilson_proportion_ci(
-            events=stratum_events_value,
-            n=stratum_n,
+            events=count,
+            n=denominator,
             confidence=confidence,
         )
 
@@ -1409,18 +1418,7 @@ def _compute_proportion_stratum_stats(
     reference_weights: pl.DataFrame,
     confidence: float = 0.95,
 ) -> dict[str, object]:
-    """
-    Calculate a DSP and MOVER interval across standardisation strata.
-
-    Observed strata use their uncorrected observed proportions. Where a
-    positively weighted standard stratum is absent from the group, that
-    stratum is excluded and the remaining reference weights are
-    renormalised to sum to one.
-
-    Renormalisation changes the target population to the subset of the
-    reference population supported by the group. Metadata describing the
-    omitted strata and omitted reference weight is returned for reporting.
-    """
+    """Calculate a DSP and Wilson-MOVER interval across strata."""
     aggregation = (
         group_data.group_by(strata_cols)
         .agg(
@@ -1573,73 +1571,114 @@ def _compute_proportion_stratum_stats(
 # ===========================================================================
 
 
-def _haldane_rate_correction(
-    events: float,
-    denominator: float,
-) -> tuple[float, float, float]:
-    """Apply a Haldane-style correction to a rate stratum."""
-    corrected_events = events + 0.5
-    corrected_denominator = denominator + 1.0
-
-    return (
-        float(
-            corrected_events
-            / corrected_denominator,
-        ),
-        float(corrected_events),
-        float(corrected_denominator),
-    )
-
-
-def _dobson_byar_rate_ci(
-    dsr_unscaled: float,
-    crude_events: float,
+def _mover_weighted_rate_ci(
     stratum_weights: np.ndarray,
     stratum_events: np.ndarray,
     stratum_denominators: np.ndarray,
     confidence: float = 0.95,
 ) -> tuple[float, float, float]:
-    """Calculate a Dobson-Byar interval for an unscaled DSR."""
-    if crude_events < 0:
-        return (
-            np.nan,
-            np.nan,
-            np.nan,
+    """
+    Calculate a Poisson-MOVER interval for a weighted sum of rates.
+
+    Stratum rates use uncorrected observed event counts and denominators.
+    Exact Poisson count intervals are used for strata with fewer than
+    10 events; Byar count intervals are used otherwise.
+
+    Weights are normalised over positively weighted strata with positive
+    exposure.
+
+    Returns
+    -------
+    tuple[float, float, float]
+        Unscaled weighted rate, lower confidence limit, and upper
+        confidence limit.
+    """
+    arrays = (
+        stratum_weights,
+        stratum_events,
+        stratum_denominators,
+    )
+
+    if any(
+        array.ndim != 1
+        for array in arrays
+    ):
+        raise ValueError(
+            "MOVER inputs must be one-dimensional arrays."
         )
 
-    if crude_events < 10:
-        (
-            count_lower,
-            count_upper,
-        ) = _exact_poisson_count_ci(
-            crude_events,
-            confidence,
+    if len(
+        {
+            len(array)
+            for array in arrays
+        },
+    ) != 1:
+        raise ValueError(
+            "MOVER weights, events, and denominators must have equal "
+            "lengths."
         )
 
-    else:
-        (
-            count_lower,
-            count_upper,
-        ) = _byar_count_ci(
-            crude_events,
-            confidence,
+    if np.any(
+        np.isfinite(stratum_weights)
+        & (stratum_weights < 0)
+    ):
+        raise ValueError(
+            "MOVER stratum weights must be non-negative."
+        )
+
+    if np.any(
+        np.isfinite(stratum_events)
+        & (stratum_events < 0)
+    ):
+        raise ValueError(
+            "MOVER stratum events must be non-negative."
+        )
+
+    if np.any(
+        np.isfinite(stratum_denominators)
+        & (stratum_denominators < 0)
+    ):
+        raise ValueError(
+            "MOVER stratum denominators must be non-negative."
         )
 
     valid = (
-        stratum_denominators > 0
+        np.isfinite(stratum_weights)
+        & np.isfinite(stratum_events)
+        & np.isfinite(stratum_denominators)
+        & (stratum_weights > 0)
+        & (stratum_denominators > 0)
     )
 
-    weights = stratum_weights[valid]
-    events = stratum_events[valid]
-    denominators = stratum_denominators[valid]
+    if not np.any(valid):
+        return (
+            np.nan,
+            np.nan,
+            np.nan,
+        )
+
+    weights = (
+        stratum_weights[valid]
+        .astype(float)
+    )
+
+    events = (
+        stratum_events[valid]
+        .astype(float)
+    )
+
+    denominators = (
+        stratum_denominators[valid]
+        .astype(float)
+    )
 
     weight_sum = float(
-        np.sum(stratum_weights),
+        np.sum(weights),
     )
 
     if (
-        weight_sum == 0
-        or len(weights) == 0
+        not np.isfinite(weight_sum)
+        or weight_sum <= 0
     ):
         return (
             np.nan,
@@ -1647,80 +1686,99 @@ def _dobson_byar_rate_ci(
             np.nan,
         )
 
-    variance_dsr = float(
+    weights = weights / weight_sum
+    rates = events / denominators
+
+    lower_limits = np.empty(
+        len(rates),
+        dtype=float,
+    )
+
+    upper_limits = np.empty(
+        len(rates),
+        dtype=float,
+    )
+
+    for index, (
+        count,
+        denominator,
+    ) in enumerate(
+        zip(
+            events,
+            denominators,
+        ),
+    ):
+        if count < 10:
+            (
+                count_lower,
+                count_upper,
+            ) = _exact_poisson_count_ci(
+                count=count,
+                confidence=confidence,
+            )
+
+        else:
+            (
+                count_lower,
+                count_upper,
+            ) = _byar_count_ci(
+                count=count,
+                confidence=confidence,
+            )
+
+        lower_limits[index] = (
+            count_lower / denominator
+        )
+
+        upper_limits[index] = (
+            count_upper / denominator
+        )
+
+    estimate = float(
         np.sum(
-            weights**2
-            * events
-            / denominators**2,
-        )
-        / weight_sum**2,
-    )
-
-    variance_events = float(
-        crude_events,
-    )
-
-    if variance_events == 0.0:
-        (
-            _,
-            corrected_events,
-            _,
-        ) = _haldane_rate_correction(
-            crude_events,
-            1.0,
-        )
-
-        variance_events = corrected_events
-
-    if (
-        variance_events == 0.0
-        or variance_dsr == 0.0
-    ):
-        return (
-            float(dsr_unscaled),
-            float(dsr_unscaled),
-            variance_dsr,
-        )
-
-    scale = float(
-        np.sqrt(
-            variance_dsr
-            / variance_events,
+            weights * rates,
         ),
     )
 
-    lower = (
-        dsr_unscaled
-        + scale
-        * (
-            count_lower
-            - crude_events
-        )
+    lower_distance = float(
+        np.sqrt(
+            np.sum(
+                weights**2
+                * (
+                    rates
+                    - lower_limits
+                )
+                ** 2,
+            ),
+        ),
+    )
+
+    upper_distance = float(
+        np.sqrt(
+            np.sum(
+                weights**2
+                * (
+                    upper_limits
+                    - rates
+                )
+                ** 2,
+            ),
+        ),
+    )
+
+    lower = max(
+        0.0,
+        estimate - lower_distance,
     )
 
     upper = (
-        dsr_unscaled
-        + scale
-        * (
-            count_upper
-            - crude_events
-        )
+        estimate + upper_distance
     )
 
     return (
-        float(
-            max(
-                lower,
-                0.0,
-            ),
-        ),
-        float(
-            max(
-                upper,
-                0.0,
-            ),
-        ),
-        variance_dsr,
+        estimate,
+        float(lower),
+        float(upper),
     )
 
 
@@ -1731,8 +1789,14 @@ def _compute_rate_stratum_stats(
     denominator_col: str,
     strata_cols: list[str],
     reference_weights: pl.DataFrame,
+    confidence: float = 0.95,
 ) -> dict[str, object]:
-    """Calculate rate statistics across standardisation strata."""
+    """
+    Calculate a DSR and Poisson-MOVER interval across strata.
+
+    Positively weighted reference strata with zero group exposure are
+    omitted. Remaining reference weights are renormalised to sum to one.
+    """
     aggregation = (
         group_data.group_by(strata_cols)
         .agg(
@@ -1784,61 +1848,117 @@ def _compute_rate_stratum_stats(
         .astype(float)
     )
 
-    weights = (
+    reference_weight_values = (
         scaffold["ref_weight"]
         .to_numpy()
         .astype(float)
     )
 
-    rates = np.zeros(
-        len(raw_events),
+    observed_mask = (
+        (raw_denominators > 0)
+        & (reference_weight_values > 0)
     )
 
-    corrected_events = raw_events.copy()
-    corrected_denominators = raw_denominators.copy()
+    missing_mask = (
+        (raw_denominators == 0)
+        & (reference_weight_values > 0)
+    )
 
-    haldane_applied = False
-
-    for index, (
-        events,
-        denominator,
-    ) in enumerate(
-        zip(
-            raw_events,
-            raw_denominators,
+    observed_reference_weight = float(
+        np.sum(
+            reference_weight_values[
+                observed_mask
+            ],
         ),
-    ):
-        if denominator == 0:
-            rates[index] = 0.0
+    )
 
-        elif events == 0:
-            (
-                corrected_rate,
-                corrected_event_count,
-                corrected_denominator,
-            ) = _haldane_rate_correction(
-                events,
-                denominator,
-            )
+    missing_reference_weight = float(
+        np.sum(
+            reference_weight_values[
+                missing_mask
+            ],
+        ),
+    )
 
-            rates[index] = corrected_rate
-            corrected_events[index] = corrected_event_count
-            corrected_denominators[index] = corrected_denominator
-            haldane_applied = True
+    missing_strata_count = int(
+        np.sum(
+            missing_mask,
+        ),
+    )
 
-        else:
-            rates[index] = (
-                events / denominator
-            )
+    normalised_weights = np.zeros_like(
+        reference_weight_values,
+        dtype=float,
+    )
+
+    if observed_reference_weight > 0:
+        normalised_weights[
+            observed_mask
+        ] = (
+            reference_weight_values[
+                observed_mask
+            ]
+            / observed_reference_weight
+        )
+
+    (
+        estimate,
+        lower,
+        upper,
+    ) = _mover_weighted_rate_ci(
+        stratum_weights=normalised_weights,
+        stratum_events=raw_events,
+        stratum_denominators=raw_denominators,
+        confidence=confidence,
+    )
+
+    stratum_rates = np.full(
+        len(raw_events),
+        np.nan,
+        dtype=float,
+    )
+
+    stratum_rates[
+        observed_mask
+    ] = (
+        raw_events[
+            observed_mask
+        ]
+        / raw_denominators[
+            observed_mask
+        ]
+    )
+
+    exact_strata_count = int(
+        np.sum(
+            observed_mask
+            & (raw_events < 10)
+        ),
+    )
+
+    byar_strata_count = int(
+        np.sum(
+            observed_mask
+            & (raw_events >= 10)
+        ),
+    )
 
     return {
-        "stratum_rates": rates,
-        "stratum_events": corrected_events,
-        "stratum_denoms": corrected_denominators,
-        "stratum_weights": weights,
-        "raw_stratum_denoms": raw_denominators,
+        "dsr": estimate,
+        "dsr_lower": lower,
+        "dsr_upper": upper,
+        "stratum_rates": stratum_rates,
+        "stratum_events": raw_events,
+        "stratum_denominators": raw_denominators,
+        "reference_weights": reference_weight_values,
+        "normalised_weights": normalised_weights,
         "raw_stratum_events": raw_events,
-        "haldane_applied": haldane_applied,
+        "raw_stratum_denominators": raw_denominators,
+        "missing_strata_count": missing_strata_count,
+        "missing_reference_weight": missing_reference_weight,
+        "observed_reference_weight": observed_reference_weight,
+        "exact_strata_count": exact_strata_count,
+        "byar_strata_count": byar_strata_count,
     }
 
 
@@ -1945,12 +2065,7 @@ def _significance_from_ci(
     lower: float,
     upper: float,
 ) -> str:
-    """
-    Classify an estimate relative to a fixed reference value.
-
-    This is a descriptive confidence-interval comparison, not a formal
-    hypothesis test.
-    """
+    """Classify a confidence interval relative to a fixed reference."""
     if (
         not np.isfinite(reference)
         or not np.isfinite(lower)
@@ -1982,7 +2097,7 @@ def crude_proportion_df(
     all_label: str = "All",
     confidence: float = 0.95,
 ) -> pl.DataFrame:
-    """Calculate crude proportions across configured grouping sets."""
+    """Calculate crude proportions using Wilson score intervals."""
     _validate_options(
         confidence,
     )
@@ -2019,13 +2134,11 @@ def crude_proportion_df(
     )
 
     overall_n = float(
-        len(df),
+        df.height,
     )
 
     reference = (
         overall_events / overall_n
-        if overall_n
-        else np.nan
     )
 
     records: list[dict[str, object]] = []
@@ -2045,7 +2158,7 @@ def crude_proportion_df(
         )
 
         n = float(
-            len(group_data),
+            group_data.height,
         )
 
         (
@@ -2060,8 +2173,6 @@ def crude_proportion_df(
 
         estimate = (
             events / n
-            if n
-            else np.nan
         )
 
         records.append(
@@ -2106,7 +2217,7 @@ def crude_rate_df(
     multiplier: float = 100_000.0,
     confidence: float = 0.95,
 ) -> pl.DataFrame:
-    """Calculate crude rates across configured grouping sets."""
+    """Calculate crude rates using exact or Byar Poisson intervals."""
     _validate_options(
         confidence,
         multiplier,
@@ -2155,15 +2266,13 @@ def crude_rate_df(
         overall_events
         / overall_denominator
         * multiplier
-        if overall_denominator
-        else np.nan
     )
 
     def calculate(
         events: float,
         denominator: float,
     ) -> tuple[float, float, float, str]:
-        if not denominator:
+        if denominator <= 0:
             return (
                 np.nan,
                 np.nan,
@@ -2274,39 +2383,14 @@ def directly_standardized_proportion_df(
     all_label: str = "All",
     confidence: float = 0.95,
 ) -> pl.DataFrame:
-    """
-    Calculate directly standardised proportions using MOVER intervals.
-
-    Stratum-specific point estimates are the uncorrected observed
-    proportions. Wilson score intervals are calculated within each stratum
-    and combined using the Method of Variance Estimates Recovery.
-
-    Where a group has no observations in a positively weighted reference
-    stratum, that stratum is omitted and the remaining reference weights
-    are renormalised to sum to one. The omission and omitted reference
-    weight are recorded in the notes column.
-    """
+    """Calculate directly standardised proportions using Wilson-MOVER."""
     _validate_options(
         confidence,
     )
 
-    if (
-        isinstance(strata_cols, (str, bytes))
-        or not isinstance(strata_cols, Sequence)
-    ):
-        raise TypeError(
-            "strata_cols must be a sequence of column names, not a "
-            "single string."
-        )
-
-    strata = list(
+    strata = _validate_strata_cols(
         strata_cols,
     )
-
-    if not strata:
-        raise ValueError(
-            "strata_cols must contain at least one column."
-        )
 
     (
         df,
@@ -2378,20 +2462,18 @@ def directly_standardized_proportion_df(
         )
 
         n = float(
-            len(group_data),
+            group_data.height,
         )
 
         notes: list[str] = []
 
         if is_reference:
-            stratum_statistics = (
-                reference_statistics
-            )
+            stratum_statistics = reference_statistics
 
             notes.append(
                 "Reference population: full standardisation weights "
-                "used; the standardised point estimate equals the "
-                "overall observed proportion."
+                "used; the standardised estimate equals the overall "
+                "observed proportion."
             )
 
         else:
@@ -2425,32 +2507,20 @@ def directly_standardized_proportion_df(
         )
 
         if missing_strata_count:
-            missing_reference_weight = float(
-                stratum_statistics[
-                    "missing_reference_weight"
-                ],
-            )
-
-            observed_reference_weight = float(
-                stratum_statistics[
-                    "observed_reference_weight"
-                ],
-            )
-
-            stratum_word = (
-                "stratum"
-                if missing_strata_count == 1
-                else "strata"
-            )
-
             notes.append(
-                "Calculated with missing standardisation "
-                f"{stratum_word}: {missing_strata_count} "
-                f"{stratum_word} omitted, representing "
-                f"{missing_reference_weight:.1%} of the reference "
-                "population; the remaining reference weights "
-                f"({observed_reference_weight:.1%} coverage) were "
-                "renormalised to sum to 1."
+                _missing_strata_note(
+                    missing_strata_count=missing_strata_count,
+                    missing_reference_weight=float(
+                        stratum_statistics[
+                            "missing_reference_weight"
+                        ],
+                    ),
+                    observed_reference_weight=float(
+                        stratum_statistics[
+                            "observed_reference_weight"
+                        ],
+                    ),
+                ),
             )
 
         if any(
@@ -2539,6 +2609,8 @@ def directly_standardized_proportion_df(
                     if np.isfinite(upper)
                     else np.nan
                 ),
+                "confidence": confidence,
+                "method": "Wilson-MOVER",
                 "notes": " | ".join(notes),
                 "significance": (
                     "Reference"
@@ -2569,29 +2641,25 @@ def directly_standardized_rate_df(
     multiplier: float = 100_000.0,
     confidence: float = 0.95,
 ) -> pl.DataFrame:
-    """Calculate DSRs across configured grouping sets."""
+    """
+    Calculate directly standardised rates using Poisson-MOVER.
+
+    Stratum rates use uncorrected observed counts. Exact Poisson intervals
+    are used for strata with fewer than 10 events; Byar intervals are used
+    otherwise. Missing positively weighted strata are omitted and remaining
+    reference weights are renormalised.
+
+    DSRs with fewer than 10 total events are returned but explicitly flagged
+    as unstable rather than suppressed.
+    """
     _validate_options(
         confidence,
         multiplier,
     )
 
-    if (
-        isinstance(strata_cols, (str, bytes))
-        or not isinstance(strata_cols, Sequence)
-    ):
-        raise TypeError(
-            "strata_cols must be a sequence of column names, not a "
-            "single string."
-        )
-
-    strata = list(
+    strata = _validate_strata_cols(
         strata_cols,
     )
-
-    if not strata:
-        raise ValueError(
-            "strata_cols must contain at least one column."
-        )
 
     (
         df,
@@ -2635,21 +2703,25 @@ def directly_standardized_rate_df(
         strata,
     )
 
-    overall_events = float(
-        work[event_col].sum(),
+    reference_statistics = (
+        _compute_rate_stratum_stats(
+            group_data=work,
+            all_strata=all_strata,
+            event_col=event_col,
+            denominator_col=_DENOM_COL,
+            strata_cols=strata,
+            reference_weights=reference_weights,
+            confidence=confidence,
+        )
     )
 
-    overall_denominator = float(
-        work[_DENOM_COL].sum(),
+    reference_unscaled = float(
+        reference_statistics["dsr"],
     )
 
-    reference_unscaled = (
-        overall_events / overall_denominator
-        if overall_denominator
-        else np.nan
-    )
-
-    def scale(value: float) -> float:
+    def scale(
+        value: float,
+    ) -> float:
         if not np.isfinite(value):
             return np.nan
 
@@ -2657,6 +2729,10 @@ def directly_standardized_rate_df(
             value * multiplier,
             6,
         )
+
+    reference = scale(
+        reference_unscaled,
+    )
 
     records: list[dict[str, object]] = []
 
@@ -2688,37 +2764,11 @@ def directly_standardized_rate_df(
         ]
 
         if is_reference:
-            estimate_unscaled = reference_unscaled
-
-            if events < 10:
-                (
-                    count_lower,
-                    count_upper,
-                ) = _exact_poisson_count_ci(
-                    events,
-                    confidence,
-                )
-
-            else:
-                (
-                    count_lower,
-                    count_upper,
-                ) = _byar_count_ci(
-                    events,
-                    confidence,
-                )
-
-            lower_unscaled = (
-                count_lower / denominator
-            )
-
-            upper_unscaled = (
-                count_upper / denominator
-            )
+            stratum_statistics = reference_statistics
 
             notes.append(
-                "Overall rate: no weighting applied because this row "
-                "is the reference population."
+                "Reference population: full standardisation weights "
+                "used."
             )
 
         else:
@@ -2730,76 +2780,97 @@ def directly_standardized_rate_df(
                     denominator_col=_DENOM_COL,
                     strata_cols=strata,
                     reference_weights=reference_weights,
+                    confidence=confidence,
                 )
             )
 
-            weight_sum = float(
-                np.sum(
-                    stratum_statistics[
-                        "stratum_weights"
-                    ],
+        estimate_unscaled = float(
+            stratum_statistics["dsr"],
+        )
+
+        lower_unscaled = float(
+            stratum_statistics["dsr_lower"],
+        )
+
+        upper_unscaled = float(
+            stratum_statistics["dsr_upper"],
+        )
+
+        missing_strata_count = int(
+            stratum_statistics[
+                "missing_strata_count"
+            ],
+        )
+
+        if missing_strata_count:
+            notes.append(
+                _missing_strata_note(
+                    missing_strata_count=missing_strata_count,
+                    missing_reference_weight=float(
+                        stratum_statistics[
+                            "missing_reference_weight"
+                        ],
+                    ),
+                    observed_reference_weight=float(
+                        stratum_statistics[
+                            "observed_reference_weight"
+                        ],
+                    ),
                 ),
             )
 
-            estimate_unscaled = (
-                float(
-                    np.sum(
-                        stratum_statistics[
-                            "stratum_weights"
-                        ]
-                        * stratum_statistics[
-                            "stratum_rates"
-                        ],
-                    )
-                    / weight_sum,
-                )
-                if weight_sum
-                else np.nan
+        if any(
+            0 < stratum_denominator < 10
+            for stratum_denominator in stratum_statistics[
+                "raw_stratum_denominators"
+            ]
+        ):
+            notes.append(
+                "Unreliable: stratum denominator < 10."
             )
-
-            (
-                lower_unscaled,
-                upper_unscaled,
-                _,
-            ) = _dobson_byar_rate_ci(
-                dsr_unscaled=estimate_unscaled,
-                crude_events=events,
-                stratum_weights=stratum_statistics[
-                    "stratum_weights"
-                ],
-                stratum_events=stratum_statistics[
-                    "stratum_events"
-                ],
-                stratum_denominators=stratum_statistics[
-                    "stratum_denoms"
-                ],
-                confidence=confidence,
-            )
-
-            if stratum_statistics["haldane_applied"]:
-                notes.append(
-                    "Haldane correction applied."
-                )
-
-            if any(
-                0 < stratum_denominator < 10
-                for stratum_denominator in stratum_statistics[
-                    "raw_stratum_denoms"
-                ]
-            ):
-                notes.append(
-                    "Unreliable: stratum denominator < 10."
-                )
 
         if events == 0:
             notes.append(
-                "Zero events."
+                "Zero total events: the DSR point estimate may be zero, "
+                "but the Poisson-MOVER upper confidence limit remains "
+                "positive."
             )
 
-        elif events < 10:
+        if events < 10:
             notes.append(
-                "Low event count (<10): DSR should generally not be "
-                "reported."
+                "Low total event count (<10): DSR calculated but should "
+                "be treated as unstable and may be unsuitable for "
+                "publication."
+            )
+
+        exact_strata_count = int(
+            stratum_statistics[
+                "exact_strata_count"
+            ],
+        )
+
+        byar_strata_count = int(
+            stratum_statistics[
+                "byar_strata_count"
+            ],
+        )
+
+        if exact_strata_count and byar_strata_count:
+            method = (
+                "Poisson-MOVER using exact and Byar "
+                "stratum intervals"
+            )
+
+        elif exact_strata_count:
+            method = (
+                "Poisson-MOVER using exact "
+                "stratum intervals"
+            )
+
+        else:
+            method = (
+                "Poisson-MOVER using Byar "
+                "stratum intervals"
             )
 
         estimate = scale(
@@ -2826,12 +2897,14 @@ def directly_standardized_rate_df(
                 "dsr_lower": lower,
                 "dsr_upper": upper,
                 "multiplier": multiplier,
+                "confidence": confidence,
+                "method": method,
                 "notes": " | ".join(notes),
                 "significance": (
                     "Reference"
                     if is_reference
                     else _significance_from_ci(
-                        scale(reference_unscaled),
+                        reference,
                         lower,
                         upper,
                     )
