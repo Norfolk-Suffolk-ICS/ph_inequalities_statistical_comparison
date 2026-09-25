@@ -6,7 +6,8 @@
 # To ignore a folder                    --> folder_name/
 # To ignore everything except one file  --> *.txt 
 # To include a specific file            --> !important.txt  (tracks this file even though all .txt are ignored)
-
+#
+.coverage
 
 # Ignoring secrets file
 *connections.toml
