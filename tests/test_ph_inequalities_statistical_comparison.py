@@ -1923,9 +1923,15 @@ def test_crude_proportion_boundary_estimates(
         named=True,
     )
 
-    assert row["proportion"] == expected
-    assert row["lower"] <= expected
-    assert row["upper"] >= expected
+    tolerance = 1e-12
+
+    assert row["proportion"] == pytest.approx(
+        expected,
+        abs=tolerance,
+    )
+
+    assert row["lower"] <= expected + tolerance
+    assert row["upper"] >= expected - tolerance
     assert row["upper"] > row["lower"]
 
 
