@@ -1,4 +1,4 @@
-# Repository introduction 
+# Repository introduction (PACKAGE DOCUMENT OUTOFDATE)
 
 This repository contains a python package to automate statistical comparison of health indicators across various domains of inequalities within a snowflake environment.
 
