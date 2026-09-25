@@ -35,12 +35,10 @@ from ph_inequalities_statistical_comparison.core import (
     _prepare_dataframe_proportion,
     _prepare_dataframe_rate,
     _significance_from_ci,
-    _validate_numerator_col,
     _validate_options,
     _validate_strata_cols,
     _wilson_proportion_ci,
 )
-
 
 PUBLIC_NAMES = {
     "crude_proportion_df",
@@ -68,19 +66,13 @@ def reference_wilson(
 
     scale = 1 + z_value**2 / denominator
 
-    centre = (
-        proportion
-        + z_value**2 / (2 * denominator)
-    ) / scale
+    centre = (proportion + z_value**2 / (2 * denominator)) / scale
 
     half_width = (
         z_value
         * np.sqrt(
-            proportion
-            * (1 - proportion)
-            / denominator
-            + z_value**2
-            / (4 * denominator**2),
+            proportion * (1 - proportion) / denominator
+            + z_value**2 / (4 * denominator**2),
         )
         / scale
     )
@@ -129,16 +121,10 @@ def reference_byar(
         1 - alpha / 2,
     )
 
-    lower = count * (
-        1
-        - 1 / (9 * count)
-        - z_value / (3 * np.sqrt(count))
-    ) ** 3
+    lower = count * (1 - 1 / (9 * count) - z_value / (3 * np.sqrt(count))) ** 3
 
     upper = (count + 1) * (
-        1
-        - 1 / (9 * (count + 1))
-        + z_value / (3 * np.sqrt(count + 1))
+        1 - 1 / (9 * (count + 1)) + z_value / (3 * np.sqrt(count + 1))
     ) ** 3
 
     return (
@@ -189,12 +175,7 @@ def reference_mover_proportion(
         - float(
             np.sqrt(
                 np.sum(
-                    weights**2
-                    * (
-                        proportions
-                        - lower_limits
-                    )
-                    ** 2,
+                    weights**2 * (proportions - lower_limits) ** 2,
                 ),
             ),
         ),
@@ -206,12 +187,7 @@ def reference_mover_proportion(
         + float(
             np.sqrt(
                 np.sum(
-                    weights**2
-                    * (
-                        upper_limits
-                        - proportions
-                    )
-                    ** 2,
+                    weights**2 * (upper_limits - proportions) ** 2,
                 ),
             ),
         ),
@@ -242,18 +218,14 @@ def reference_mover_rate(
         denominators,
     ):
         if count < 10:
-            count_lower, count_upper = (
-                reference_exact_poisson(
-                    count,
-                    confidence,
-                )
+            count_lower, count_upper = reference_exact_poisson(
+                count,
+                confidence,
             )
         else:
-            count_lower, count_upper = (
-                reference_byar(
-                    count,
-                    confidence,
-                )
+            count_lower, count_upper = reference_byar(
+                count,
+                confidence,
             )
 
         lower_limits.append(
@@ -278,31 +250,18 @@ def reference_mover_rate(
         - float(
             np.sqrt(
                 np.sum(
-                    weights**2
-                    * (
-                        rates
-                        - lower_array
-                    )
-                    ** 2,
+                    weights**2 * (rates - lower_array) ** 2,
                 ),
             ),
         ),
     )
 
-    upper = (
-        estimate
-        + float(
-            np.sqrt(
-                np.sum(
-                    weights**2
-                    * (
-                        upper_array
-                        - rates
-                    )
-                    ** 2,
-                ),
+    upper = estimate + float(
+        np.sqrt(
+            np.sum(
+                weights**2 * (upper_array - rates) ** 2,
             ),
-        )
+        ),
     )
 
     return (
@@ -515,10 +474,7 @@ def test_package_functions_match_core_exports() -> None:
         is directly_standardized_proportion_df
     )
 
-    assert (
-        package.directly_standardized_rate_df
-        is directly_standardized_rate_df
-    )
+    assert package.directly_standardized_rate_df is directly_standardized_rate_df
 
 
 # ===========================================================================
@@ -540,18 +496,14 @@ def test_wilson_matches_reference(
     denominator: float,
 ) -> None:
     """Wilson limits match an independent implementation."""
-    expected_lower, expected_upper = (
-        reference_wilson(
-            events,
-            denominator,
-        )
+    expected_lower, expected_upper = reference_wilson(
+        events,
+        denominator,
     )
 
-    lower, upper, variance = (
-        _wilson_proportion_ci(
-            events,
-            denominator,
-        )
+    lower, upper, variance = _wilson_proportion_ci(
+        events,
+        denominator,
     )
 
     assert lower == pytest.approx(
@@ -565,19 +517,15 @@ def test_wilson_matches_reference(
     expected_proportion = events / denominator
 
     assert variance == pytest.approx(
-        expected_proportion
-        * (1 - expected_proportion)
-        / denominator,
+        expected_proportion * (1 - expected_proportion) / denominator,
     )
 
 
 def test_wilson_zero_denominator_returns_nan() -> None:
     """A zero denominator has no estimable Wilson interval."""
-    lower, upper, variance = (
-        _wilson_proportion_ci(
-            0,
-            0,
-        )
+    lower, upper, variance = _wilson_proportion_ci(
+        0,
+        0,
     )
 
     assert np.isnan(lower)
@@ -695,18 +643,16 @@ def test_proportion_mover_matches_reference() -> None:
 
 def test_proportion_mover_zero_events_has_positive_upper_limit() -> None:
     """Zero-event strata retain a zero estimate and positive upper limit."""
-    estimate, lower, upper = (
-        _mover_weighted_proportion_ci(
-            stratum_weights=np.array(
-                [0.5, 0.5],
-            ),
-            stratum_events=np.array(
-                [0.0, 0.0],
-            ),
-            stratum_ns=np.array(
-                [10.0, 20.0],
-            ),
-        )
+    estimate, lower, upper = _mover_weighted_proportion_ci(
+        stratum_weights=np.array(
+            [0.5, 0.5],
+        ),
+        stratum_events=np.array(
+            [0.0, 0.0],
+        ),
+        stratum_ns=np.array(
+            [10.0, 20.0],
+        ),
     )
 
     assert estimate == 0
@@ -716,18 +662,16 @@ def test_proportion_mover_zero_events_has_positive_upper_limit() -> None:
 
 def test_proportion_mover_all_events_has_nonzero_lower_limit() -> None:
     """All-event strata retain an estimate of one."""
-    estimate, lower, upper = (
-        _mover_weighted_proportion_ci(
-            stratum_weights=np.array(
-                [0.5, 0.5],
-            ),
-            stratum_events=np.array(
-                [10.0, 20.0],
-            ),
-            stratum_ns=np.array(
-                [10.0, 20.0],
-            ),
-        )
+    estimate, lower, upper = _mover_weighted_proportion_ci(
+        stratum_weights=np.array(
+            [0.5, 0.5],
+        ),
+        stratum_events=np.array(
+            [10.0, 20.0],
+        ),
+        stratum_ns=np.array(
+            [10.0, 20.0],
+        ),
     )
 
     assert estimate == pytest.approx(1)
@@ -768,18 +712,16 @@ def test_rate_mover_matches_reference() -> None:
 
 def test_rate_mover_zero_events_has_positive_upper_limit() -> None:
     """An all-zero DSR has a positive MOVER upper confidence limit."""
-    estimate, lower, upper = (
-        _mover_weighted_rate_ci(
-            stratum_weights=np.array(
-                [0.5, 0.5],
-            ),
-            stratum_events=np.array(
-                [0.0, 0.0],
-            ),
-            stratum_denominators=np.array(
-                [100.0, 200.0],
-            ),
-        )
+    estimate, lower, upper = _mover_weighted_rate_ci(
+        stratum_weights=np.array(
+            [0.5, 0.5],
+        ),
+        stratum_events=np.array(
+            [0.0, 0.0],
+        ),
+        stratum_denominators=np.array(
+            [100.0, 200.0],
+        ),
     )
 
     assert estimate == 0
@@ -953,10 +895,7 @@ def test_grouping_sets_remove_duplicates() -> None:
         mode="separate",
     )
 
-    active_states = [
-        grouping_set.active_cols
-        for grouping_set in grouping_sets
-    ]
+    active_states = [grouping_set.active_cols for grouping_set in grouping_sets]
 
     assert len(active_states) == len(
         set(active_states),
@@ -1867,11 +1806,9 @@ def test_crude_proportion_point_estimate_and_interval() -> None:
         named=True,
     )
 
-    expected_lower, expected_upper = (
-        reference_wilson(
-            2,
-            4,
-        )
+    expected_lower, expected_upper = reference_wilson(
+        2,
+        4,
     )
 
     assert row["events"] == 2
@@ -1956,20 +1893,29 @@ def test_crude_proportion_significance_labels() -> None:
         inequalities_cols=["group"],
     )
 
-    assert get_row(
-        result,
-        group="A",
-    )["significance"] == "Higher"
+    assert (
+        get_row(
+            result,
+            group="A",
+        )["significance"]
+        == "Higher"
+    )
 
-    assert get_row(
-        result,
-        group="B",
-    )["significance"] == "Lower"
+    assert (
+        get_row(
+            result,
+            group="B",
+        )["significance"]
+        == "Lower"
+    )
 
-    assert get_row(
-        result,
-        group="All",
-    )["significance"] == "Reference"
+    assert (
+        get_row(
+            result,
+            group="All",
+        )["significance"]
+        == "Reference"
+    )
 
 
 def test_crude_proportion_output_schema() -> None:
@@ -2027,10 +1973,8 @@ def test_crude_rate_uses_exact_interval_below_ten() -> None:
         named=True,
     )
 
-    expected_lower, expected_upper = (
-        reference_exact_poisson(
-            3,
-        )
+    expected_lower, expected_upper = reference_exact_poisson(
+        3,
     )
 
     assert row["events"] == 3
@@ -2040,15 +1984,11 @@ def test_crude_rate_uses_exact_interval_below_ten() -> None:
     )
 
     assert row["lower"] == pytest.approx(
-        expected_lower
-        / 3
-        * 1_000,
+        expected_lower / 3 * 1_000,
     )
 
     assert row["upper"] == pytest.approx(
-        expected_upper
-        / 3
-        * 1_000,
+        expected_upper / 3 * 1_000,
     )
 
     assert row["method"] == "Exact chi-square"
@@ -2076,10 +2016,8 @@ def test_crude_rate_uses_byar_from_ten_events() -> None:
         named=True,
     )
 
-    expected_lower, expected_upper = (
-        reference_byar(
-            10,
-        )
+    expected_lower, expected_upper = reference_byar(
+        10,
     )
 
     assert row["rate"] == pytest.approx(
@@ -2087,15 +2025,11 @@ def test_crude_rate_uses_byar_from_ten_events() -> None:
     )
 
     assert row["lower"] == pytest.approx(
-        expected_lower
-        / 10
-        * 1_000,
+        expected_lower / 10 * 1_000,
     )
 
     assert row["upper"] == pytest.approx(
-        expected_upper
-        / 10
-        * 1_000,
+        expected_upper / 10 * 1_000,
     )
 
     assert row["method"] == "Byar"
@@ -2197,11 +2131,14 @@ def test_complete_inequality_cube(
 
     assert result.height == 9
 
-    assert get_row(
-        result,
-        sex="All",
-        ethnicity="All",
-    )["significance"] == "Reference"
+    assert (
+        get_row(
+            result,
+            sex="All",
+            ethnicity="All",
+        )["significance"]
+        == "Reference"
+    )
 
 
 def test_organisational_hierarchy_rollups(
@@ -2222,20 +2159,21 @@ def test_organisational_hierarchy_rollups(
 
     assert result.height == 9
 
-    assert result.filter(
-        (pl.col("practice") != "All")
-    ).height == 4
+    assert result.filter(pl.col("practice") != "All").height == 4
 
-    assert result.filter(
-        (pl.col("icb") != "All")
-        & (pl.col("practice") == "All")
-    ).height == 2
+    assert (
+        result.filter((pl.col("icb") != "All") & (pl.col("practice") == "All")).height
+        == 2
+    )
 
-    assert result.filter(
-        (pl.col("region") != "All")
-        & (pl.col("icb") == "All")
-        & (pl.col("practice") == "All")
-    ).height == 2
+    assert (
+        result.filter(
+            (pl.col("region") != "All")
+            & (pl.col("icb") == "All")
+            & (pl.col("practice") == "All")
+        ).height
+        == 2
+    )
 
 
 def test_separate_and_cross_organisational_modes() -> None:
@@ -2373,10 +2311,7 @@ def test_dsp_missing_stratum_is_renormalised_and_noted(
     assert row["dsp"] == 0
     assert row["dsp_upper"] > 0
 
-    assert (
-        "Calculated with missing standardisation stratum"
-        in row["notes"]
-    )
+    assert "Calculated with missing standardisation stratum" in row["notes"]
 
     assert "33.3%" in row["notes"]
     assert "renormalised" in row["notes"]
@@ -2514,15 +2449,11 @@ def test_dsp_stratum_helper_reports_missing_weight(
 
     assert result["missing_strata_count"] == 1
 
-    assert result[
-        "missing_reference_weight"
-    ] == pytest.approx(
+    assert result["missing_reference_weight"] == pytest.approx(
         1 / 3,
     )
 
-    assert result[
-        "observed_reference_weight"
-    ] == pytest.approx(
+    assert result["observed_reference_weight"] == pytest.approx(
         2 / 3,
     )
 
@@ -2632,10 +2563,7 @@ def test_dsr_matches_independent_mover_calculation() -> None:
         abs=1e-6,
     )
 
-    assert (
-        row["method"]
-        == "Poisson-MOVER using exact and Byar stratum intervals"
-    )
+    assert row["method"] == "Poisson-MOVER using exact and Byar stratum intervals"
 
 
 def test_dsr_missing_stratum_is_renormalised_and_noted(
@@ -2659,10 +2587,7 @@ def test_dsr_missing_stratum_is_renormalised_and_noted(
     assert row["dsr_lower"] == 0
     assert row["dsr_upper"] > 0
 
-    assert (
-        "Calculated with missing standardisation stratum"
-        in row["notes"]
-    )
+    assert "Calculated with missing standardisation stratum" in row["notes"]
 
     assert "33.3%" in row["notes"]
     assert "renormalised" in row["notes"]
@@ -2739,10 +2664,7 @@ def test_dsr_below_ten_events_is_returned_but_flagged() -> None:
     assert np.isfinite(row["dsr_lower"])
     assert np.isfinite(row["dsr_upper"])
 
-    assert (
-        "Low total event count (<10)"
-        in row["notes"]
-    )
+    assert "Low total event count (<10)" in row["notes"]
 
 
 def test_dsr_reference_equals_overall_crude_rate(
@@ -2762,9 +2684,13 @@ def test_dsr_reference_equals_overall_crude_rate(
         group="All",
     )
 
-    expected = sum(
-        missing_strata_df["count"],
-    ) / missing_strata_df.height * 1_000
+    expected = (
+        sum(
+            missing_strata_df["count"],
+        )
+        / missing_strata_df.height
+        * 1_000
+    )
 
     assert reference["dsr"] == pytest.approx(
         expected,
@@ -2816,15 +2742,11 @@ def test_dsr_stratum_helper_reports_missing_weight(
 
     assert result["missing_strata_count"] == 1
 
-    assert result[
-        "missing_reference_weight"
-    ] == pytest.approx(
+    assert result["missing_reference_weight"] == pytest.approx(
         1 / 3,
     )
 
-    assert result[
-        "observed_reference_weight"
-    ] == pytest.approx(
+    assert result["observed_reference_weight"] == pytest.approx(
         2 / 3,
     )
 
@@ -2920,11 +2842,14 @@ def test_significance_classification(
     expected: str,
 ) -> None:
     """Fixed-reference interval classification is deterministic."""
-    assert _significance_from_ci(
-        reference,
-        lower,
-        upper,
-    ) == expected
+    assert (
+        _significance_from_ci(
+            reference,
+            lower,
+            upper,
+        )
+        == expected
+    )
 
 
 def test_missing_strata_note_singular() -> None:
@@ -3111,15 +3036,9 @@ def test_estimates_lie_within_confidence_intervals(
     assert finite.height > 0
 
     assert finite.select(
-        (
-            pl.col(lower_col)
-            <= pl.col(estimate_col)
-        ).all(),
+        (pl.col(lower_col) <= pl.col(estimate_col)).all(),
     ).item()
 
     assert finite.select(
-        (
-            pl.col(estimate_col)
-            <= pl.col(upper_col)
-        ).all(),
+        (pl.col(estimate_col) <= pl.col(upper_col)).all(),
     ).item()
