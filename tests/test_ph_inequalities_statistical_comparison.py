@@ -1,808 +1,3119 @@
-"""
-test_ph_inequalities_statistical_comparison.py
-===========================
-Pytest suite for ph_inequalities_statistical_comparison.py
-"""
+"""Tests for ph_inequalities_statistical_comparison."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import polars as pl
 import pytest
+from scipy import stats
 
-from ph_inequalities_statistical_comparison.core import (
-    _bin_numeric_to_quartiles,
-    _wilson_proportion_ci,
-    _byar_count_ci,
-    _exact_poisson_count_ci,
-    _haldane_proportion_correction,
-    _haldane_rate_correction,
-    _wilson_dobson_proportion_ci,
-    _dobson_byar_rate_ci,
-    _build_reference_weights,
-    _prepare_dataframe_proportion,
-    _prepare_dataframe_rate,
-    _compute_proportion_stratum_stats,
-    _compute_rate_stratum_stats,
-    _significance_from_ci,
-    _check_no_nulls,
-    _validate_numerator_col,
+import ph_inequalities_statistical_comparison as package
+from ph_inequalities_statistical_comparison import (
     crude_proportion_df,
     crude_rate_df,
     directly_standardized_proportion_df,
     directly_standardized_rate_df,
 )
-
-
-@pytest.fixture
-def simple_prop_df():
-    np.random.seed(42)
-    n = 400
-    return pl.DataFrame({
-        "region": np.random.choice(["North", "South", "East", "West"], n).tolist(),
-        "sex": np.random.choice(["M", "F"], n).tolist(),
-        "age": np.random.randint(20, 80, n).tolist(),
-        "event": np.random.binomial(1, 0.4, n).tolist(),
-    })
-
-
-@pytest.fixture
-def simple_rate_df():
-    np.random.seed(42)
-    n = 400
-    return pl.DataFrame({
-        "region": np.random.choice(["North", "South", "East", "West"], n).tolist(),
-        "sex": np.random.choice(["M", "F"], n).tolist(),
-        "age": np.random.randint(20, 80, n).tolist(),
-        "events": np.random.poisson(0.8, n).tolist(),
-    })
-
-
-@pytest.fixture
-def sparse_prop_df():
-    np.random.seed(7)
-    n = 60
-    return pl.DataFrame({
-        "icb": np.random.choice(["A", "B"], n).tolist(),
-        "band": np.random.choice(["1", "2", "3"], n).tolist(),
-        "event": np.random.binomial(1, 0.05, n).tolist(),
-    })
-
-
-@pytest.fixture
-def sparse_rate_df():
-    np.random.seed(7)
-    n = 60
-    return pl.DataFrame({
-        "icb": np.random.choice(["A", "B"], n).tolist(),
-        "band": np.random.choice(["1", "2", "3"], n).tolist(),
-        "events": np.random.poisson(0.05, n).tolist(),
-    })
-
-
-# ============================================================
-# Low-level statistical helpers
-# ============================================================
-
-class TestBinNumericToQuartiles:
-    def test_returns_four_labels(self):
-        s = pl.Series("x", list(range(100)))
-        out = _bin_numeric_to_quartiles(s)
-        assert set(out.to_list()) == {"Q1", "Q2", "Q3", "Q4"}
-
-    def test_none_preserved(self):
-        s = pl.Series("x", [1.0, 2.0, None, 4.0])
-        out = _bin_numeric_to_quartiles(s)
-        assert out.to_list()[2] is None
-
-
-class TestWilsonProportionCI:
-    def test_bounds_ordered(self):
-        lo, hi, var = _wilson_proportion_ci(50, 100)
-        assert 0 <= lo <= hi <= 1
-
-    def test_zero_n_returns_nan(self):
-        lo, hi, var = _wilson_proportion_ci(0, 0)
-        assert np.isnan(lo)
-
-    def test_wider_with_higher_confidence(self):
-        lo95, hi95, _ = _wilson_proportion_ci(50, 100, 0.95)
-        lo99, hi99, _ = _wilson_proportion_ci(50, 100, 0.99)
-        assert (hi99 - lo99) > (hi95 - lo95)
-
-
-class TestByarCountCI:
-    def test_zero_count(self):
-        lo, hi = _byar_count_ci(0)
-        assert lo == 0
-        assert hi > 0
-
-    def test_bounds_ordered(self):
-        lo, hi = _byar_count_ci(20)
-        assert 0 <= lo <= hi
-
-
-class TestExactPoissonCountCI:
-    def test_zero_count_lower_zero(self):
-        lo, hi = _exact_poisson_count_ci(0)
-        assert lo == 0
-        assert hi > 0
-
-    def test_bounds_ordered(self):
-        lo, hi = _exact_poisson_count_ci(5)
-        assert 0 <= lo <= hi
-
-
-class TestHaldaneProportionCorrection:
-    def test_zero_events(self):
-        p, e, n = _haldane_proportion_correction(0, 100)
-        assert p > 0
-        assert e == 0.5
-        assert n == 101.0
-
-    def test_all_events(self):
-        p, e, n = _haldane_proportion_correction(100, 100)
-        assert p < 1.0
-
-
-class TestHaldaneRateCorrection:
-    def test_zero_events_positive_rate(self):
-        r, e, d = _haldane_rate_correction(0, 100)
-        assert r > 0
-        assert e == 0.5
-        assert d == 101.0
-
-
-class TestWilsonDobsonProportionCI:
-    def test_bounds_ordered(self):
-        w = np.array([0.5, 0.5])
-        p = np.array([0.3, 0.5])
-        n = np.array([50.0, 50.0])
-        dsp = float(np.sum(w * p))
-        lo, hi, var = _wilson_dobson_proportion_ci(dsp, 40, 100, w, p, n)
-        assert 0 <= lo <= hi <= 1
-
-
-class TestDobsonByarRateCI:
-    def test_bounds_ordered(self):
-        w = np.array([0.5, 0.5])
-        Oi = np.array([10.0, 15.0])
-        ni = np.array([1000.0, 800.0])
-        dsr = np.sum(w * (Oi / ni)) / np.sum(w)
-        lo, hi, var = _dobson_byar_rate_ci(dsr, 25.0, w, Oi, ni)
-        assert 0 <= lo <= hi
-
-
-class TestReferenceWeights:
-    def test_sum_to_one(self, simple_prop_df):
-        work = _prepare_dataframe_proportion(simple_prop_df, "event", ["sex"], ["region"])
-        ref = _build_reference_weights(work, ["sex"])
-        assert abs(ref["ref_weight"].sum() - 1.0) < 1e-9
-
-
-class TestPrepareDataFrame:
-    def test_missing_column_raises_prop(self, simple_prop_df):
-        with pytest.raises(ValueError):
-            _prepare_dataframe_proportion(simple_prop_df, "event", ["missing"], ["region"])
-
-    def test_numeric_strata_binned_prop(self, simple_prop_df):
-        out = _prepare_dataframe_proportion(simple_prop_df, "event", ["age"], ["region"])
-        assert out["age"].dtype == pl.Utf8
-
-    def test_missing_column_raises_rate(self, simple_rate_df):
-        with pytest.raises(ValueError):
-            _prepare_dataframe_rate(simple_rate_df, "missing", ["sex"], ["region"])
-
-
-# ============================================================
-# Significance-from-CI helper
-# ============================================================
-
-class TestSignificanceFromCi:
-    def test_not_significant_when_reference_inside_ci(self):
-        assert _significance_from_ci(0.5, 0.4, 0.6) == "Not significant"
-
-    def test_higher_when_reference_below_lower(self):
-        assert _significance_from_ci(0.3, 0.4, 0.6) == "Higher"
-
-    def test_lower_when_reference_above_upper(self):
-        assert _significance_from_ci(0.7, 0.4, 0.6) == "Lower"
-
-    def test_not_tested_when_reference_nan(self):
-        assert _significance_from_ci(np.nan, 0.4, 0.6) == "Not tested"
-
-    def test_not_tested_when_bounds_nan(self):
-        assert _significance_from_ci(0.5, np.nan, np.nan) == "Not tested"
-
-    def test_boundary_reference_equals_lower_not_significant(self):
-        assert _significance_from_ci(0.4, 0.4, 0.6) == "Not significant"
-
-    def test_boundary_reference_equals_upper_not_significant(self):
-        assert _significance_from_ci(0.6, 0.4, 0.6) == "Not significant"
-
-
-# ============================================================
-# crude_proportion_df
-# ============================================================
-
-class TestCrudeProportionDf:
-    def test_output_columns(self, simple_prop_df):
-        out = crude_proportion_df(simple_prop_df, "event", ["region"])
-        assert set(out.columns) == {
-            "region", "events", "n", "proportion", "lower", "upper",
-            "confidence", "method", "notes", "significance"
-        }
-
-    def test_one_row_per_group_plus_overall(self, simple_prop_df):
-        out = crude_proportion_df(simple_prop_df, "event", ["region"])
-        assert out.shape[0] == 5  # 4 regions + Overall
-
-    def test_bounds_valid(self, simple_prop_df):
-        out = crude_proportion_df(simple_prop_df, "event", ["region"])
-        assert (out["lower"] <= out["proportion"]).all()
-        assert (out["proportion"] <= out["upper"]).all()
-
-    def test_no_group_cols_single_row(self, simple_prop_df):
-        out = crude_proportion_df(simple_prop_df, "event")
-        assert out.shape[0] == 1
-        assert out["significance"][0] == "Not tested"
-
-    def test_missing_column_raises(self, simple_prop_df):
-        with pytest.raises(ValueError):
-            crude_proportion_df(simple_prop_df, "missing", ["region"])
-
-    def test_boolean_event_col(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 20 + ["B"] * 20,
-            "event": [True] * 10 + [False] * 10 + [True] * 5 + [False] * 15,
-        })
-        out = crude_proportion_df(df, "event", ["grp"])
-        assert out.shape[0] == 3
-
-
-class TestCrudeProportionDfSignificance:
-    def test_columns_present(self, simple_prop_df):
-        out = crude_proportion_df(simple_prop_df, "event", ["region"])
-        assert "significance" in out.columns
-
-    def test_overall_row_is_reference(self, simple_prop_df):
-        out = crude_proportion_df(simple_prop_df, "event", ["region"])
-        overall = out.filter(pl.col("region") == "Overall")
-        assert overall["significance"][0] == "Reference"
-
-    def test_extreme_group_flagged_significant(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 100 + ["B"] * 100,
-            "event": [1] * 95 + [0] * 5 + [1] * 5 + [0] * 95,
-        })
-        out = crude_proportion_df(df, "event", ["grp"])
-        group_a = out.filter(pl.col("grp") == "A")
-        assert group_a["significance"][0] == "Higher"
-
-    def test_similar_group_not_significant(self):
-        np.random.seed(1)
-        df = pl.DataFrame({
-            "grp": ["A"] * 500 + ["B"] * 500,
-            "event": np.random.binomial(1, 0.5, 1000).tolist(),
-        })
-        out = crude_proportion_df(df, "event", ["grp"])
-        assert set(out["significance"].to_list()) <= {"Not significant", "Reference"}
-
-    def test_no_group_cols_has_not_tested(self, simple_prop_df):
-        out = crude_proportion_df(simple_prop_df, "event")
-        assert out["significance"][0] == "Not tested"
-
-    def test_reference_outside_ci_flagged_for_sparse_group(self, sparse_prop_df):
-        out = crude_proportion_df(sparse_prop_df, "event", ["icb"])
-        non_overall = out.filter(pl.col("icb") != "Overall")
-        assert set(non_overall["significance"].to_list()) <= {
-            "Higher", "Lower", "Not significant", "Not tested"
-        }
-
-
-# ============================================================
-# crude_rate_df
-# ============================================================
-
-class TestCrudeRateDf:
-    def test_output_columns(self, simple_rate_df):
-        out = crude_rate_df(simple_rate_df, "events", ["region"])
-        assert set(out.columns) == {
-            "region", "events", "denominator", "rate", "lower", "upper",
-            "multiplier", "confidence", "method", "notes", "significance"
-        }
-
-    def test_one_row_per_group_plus_overall(self, simple_rate_df):
-        out = crude_rate_df(simple_rate_df, "events", ["region"])
-        assert out.shape[0] == 5
-
-    def test_bounds_valid(self, simple_rate_df):
-        out = crude_rate_df(simple_rate_df, "events", ["region"])
-        assert (out["lower"] <= out["rate"]).all()
-        assert (out["rate"] <= out["upper"]).all()
-
-    def test_multiplier_changes_scale(self, simple_rate_df):
-        r1 = crude_rate_df(simple_rate_df, "events", ["region"], multiplier=1)
-        r100k = crude_rate_df(simple_rate_df, "events", ["region"], multiplier=100000)
-        ratio = (r100k["rate"] / r1["rate"]).mean()
-        assert abs(ratio - 100000) < 5
-
-    def test_missing_column_raises(self, simple_rate_df):
-        with pytest.raises(ValueError):
-            crude_rate_df(simple_rate_df, "missing", ["region"])
-
-
-class TestCrudeRateDfSignificance:
-    def test_columns_present(self, simple_rate_df):
-        out = crude_rate_df(simple_rate_df, "events", ["region"])
-        assert "significance" in out.columns
-
-    def test_overall_row_is_reference(self, simple_rate_df):
-        out = crude_rate_df(simple_rate_df, "events", ["region"])
-        overall = out.filter(pl.col("region") == "Overall")
-        assert overall["significance"][0] == "Reference"
-
-    def test_extreme_group_flagged_significant(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 50 + ["B"] * 50,
-            "events": [50] * 50 + [1] * 50,
-        })
-        out = crude_rate_df(df, "events", ["grp"])
-        group_a = out.filter(pl.col("grp") == "A")
-        assert group_a["significance"][0] == "Higher"
-
-    def test_sparse_group_significance_within_valid_labels(self, sparse_rate_df):
-        out = crude_rate_df(sparse_rate_df, "events", ["icb"])
-        non_overall = out.filter(pl.col("icb") != "Overall")
-        assert set(non_overall["significance"].to_list()) <= {
-            "Higher", "Lower", "Not significant", "Not tested"
-        }
-
-
-# ============================================================
-# directly_standardized_proportion_df
-# ============================================================
-
-class TestDirectlyStandardizedProportion:
-    def test_output_columns(self, simple_prop_df):
-        out = directly_standardized_proportion_df(
-            simple_prop_df, "event", ["age", "sex"], ["region"]
+from ph_inequalities_statistical_comparison.core import (
+    _DENOM_COL,
+    _add_end_of_period_denominator,
+    _build_grouping_sets,
+    _byar_count_ci,
+    _check_no_missing_or_nonfinite,
+    _compute_proportion_stratum_stats,
+    _compute_rate_stratum_stats,
+    _exact_poisson_count_ci,
+    _inequality_states,
+    _missing_strata_note,
+    _mover_weighted_proportion_ci,
+    _mover_weighted_rate_ci,
+    _normalise_hierarchies,
+    _organisational_states,
+    _prepare_dataframe_proportion,
+    _prepare_dataframe_rate,
+    _significance_from_ci,
+    _validate_numerator_col,
+    _validate_options,
+    _validate_strata_cols,
+    _wilson_proportion_ci,
+)
+
+
+PUBLIC_NAMES = {
+    "crude_proportion_df",
+    "crude_rate_df",
+    "directly_standardized_proportion_df",
+    "directly_standardized_rate_df",
+}
+
+
+# ===========================================================================
+# Reference calculations used by tests
+# ===========================================================================
+
+
+def reference_wilson(
+    events: float,
+    denominator: float,
+    confidence: float = 0.95,
+) -> tuple[float, float]:
+    """Independently calculate a Wilson score interval."""
+    proportion = events / denominator
+    z_value = stats.norm.ppf(
+        1 - (1 - confidence) / 2,
+    )
+
+    scale = 1 + z_value**2 / denominator
+
+    centre = (
+        proportion
+        + z_value**2 / (2 * denominator)
+    ) / scale
+
+    half_width = (
+        z_value
+        * np.sqrt(
+            proportion
+            * (1 - proportion)
+            / denominator
+            + z_value**2
+            / (4 * denominator**2),
         )
-        assert set(out.columns) == {
-            "region", "events", "n", "dsp", "dsp_lower", "dsp_upper",
-            "notes", "significance"
-        }
+        / scale
+    )
 
-    def test_row_count_includes_overall(self, simple_prop_df):
-        out = directly_standardized_proportion_df(
-            simple_prop_df, "event", ["age", "sex"], ["region"]
+    return (
+        max(0.0, centre - half_width),
+        min(1.0, centre + half_width),
+    )
+
+
+def reference_exact_poisson(
+    count: float,
+    confidence: float = 0.95,
+) -> tuple[float, float]:
+    """Independently calculate an exact Poisson count interval."""
+    alpha = 1 - confidence
+
+    lower = (
+        0.0
+        if count == 0
+        else 0.5
+        * stats.chi2.ppf(
+            alpha / 2,
+            2 * count,
         )
-        assert out.shape[0] == 5
+    )
 
-    def test_bounds_valid(self, simple_prop_df):
-        out = directly_standardized_proportion_df(
-            simple_prop_df, "event", ["age", "sex"], ["region"]
+    upper = 0.5 * stats.chi2.ppf(
+        1 - alpha / 2,
+        2 * (count + 1),
+    )
+
+    return (
+        float(lower),
+        float(upper),
+    )
+
+
+def reference_byar(
+    count: float,
+    confidence: float = 0.95,
+) -> tuple[float, float]:
+    """Independently calculate Byar count limits."""
+    alpha = 1 - confidence
+    z_value = stats.norm.ppf(
+        1 - alpha / 2,
+    )
+
+    lower = count * (
+        1
+        - 1 / (9 * count)
+        - z_value / (3 * np.sqrt(count))
+    ) ** 3
+
+    upper = (count + 1) * (
+        1
+        - 1 / (9 * (count + 1))
+        + z_value / (3 * np.sqrt(count + 1))
+    ) ** 3
+
+    return (
+        max(0.0, float(lower)),
+        max(0.0, float(upper)),
+    )
+
+
+def reference_mover_proportion(
+    weights: np.ndarray,
+    events: np.ndarray,
+    denominators: np.ndarray,
+    confidence: float = 0.95,
+) -> tuple[float, float, float]:
+    """Independently combine Wilson intervals using MOVER."""
+    weights = weights / weights.sum()
+    proportions = events / denominators
+
+    intervals = [
+        reference_wilson(
+            event,
+            denominator,
+            confidence,
         )
-        assert (out["dsp_lower"] <= out["dsp"]).all()
-        assert (out["dsp"] <= out["dsp_upper"]).all()
+        for event, denominator in zip(
+            events,
+            denominators,
+        )
+    ]
 
-    def test_note_haldane_applied(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 20,
-            "strat": ["X"] * 10 + ["Y"] * 10,
-            "event": [0] * 10 + [1] * 10,
-        })
-        out = directly_standardized_proportion_df(df, "event", ["strat"], ["grp"])
-        row = out.filter(pl.col("grp") == "A")
-        assert "Haldane correction applied" in row["notes"][0]
+    lower_limits = np.array(
+        [interval[0] for interval in intervals],
+    )
 
-    def test_missing_column_raises(self, simple_prop_df):
-        with pytest.raises(ValueError):
-            directly_standardized_proportion_df(
-                simple_prop_df, "event", ["missing"], ["region"]
+    upper_limits = np.array(
+        [interval[1] for interval in intervals],
+    )
+
+    estimate = float(
+        np.sum(
+            weights * proportions,
+        ),
+    )
+
+    lower = max(
+        0.0,
+        estimate
+        - float(
+            np.sqrt(
+                np.sum(
+                    weights**2
+                    * (
+                        proportions
+                        - lower_limits
+                    )
+                    ** 2,
+                ),
+            ),
+        ),
+    )
+
+    upper = min(
+        1.0,
+        estimate
+        + float(
+            np.sqrt(
+                np.sum(
+                    weights**2
+                    * (
+                        upper_limits
+                        - proportions
+                    )
+                    ** 2,
+                ),
+            ),
+        ),
+    )
+
+    return (
+        estimate,
+        lower,
+        upper,
+    )
+
+
+def reference_mover_rate(
+    weights: np.ndarray,
+    events: np.ndarray,
+    denominators: np.ndarray,
+    confidence: float = 0.95,
+) -> tuple[float, float, float]:
+    """Independently combine Poisson rate intervals using MOVER."""
+    weights = weights / weights.sum()
+    rates = events / denominators
+
+    lower_limits: list[float] = []
+    upper_limits: list[float] = []
+
+    for count, denominator in zip(
+        events,
+        denominators,
+    ):
+        if count < 10:
+            count_lower, count_upper = (
+                reference_exact_poisson(
+                    count,
+                    confidence,
+                )
+            )
+        else:
+            count_lower, count_upper = (
+                reference_byar(
+                    count,
+                    confidence,
+                )
             )
 
-
-class TestDirectlyStandardizedProportionSignificance:
-    def test_columns_present(self, simple_prop_df):
-        out = directly_standardized_proportion_df(
-            simple_prop_df, "event", ["age", "sex"], ["region"]
+        lower_limits.append(
+            count_lower / denominator,
         )
-        assert "significance" in out.columns
-
-    def test_overall_row_is_reference_and_unweighted_note(self, simple_prop_df):
-        out = directly_standardized_proportion_df(
-            simple_prop_df, "event", ["age", "sex"], ["region"]
+        upper_limits.append(
+            count_upper / denominator,
         )
-        overall = out.filter(pl.col("region") == "Overall")
-        assert overall["significance"][0] == "Reference"
-        assert "no weighting applied" in overall["notes"][0]
 
-    def test_non_overall_rows_have_significance_label(self, simple_prop_df):
-        out = directly_standardized_proportion_df(
-            simple_prop_df, "event", ["age", "sex"], ["region"]
+    lower_array = np.array(lower_limits)
+    upper_array = np.array(upper_limits)
+
+    estimate = float(
+        np.sum(
+            weights * rates,
+        ),
+    )
+
+    lower = max(
+        0.0,
+        estimate
+        - float(
+            np.sqrt(
+                np.sum(
+                    weights**2
+                    * (
+                        rates
+                        - lower_array
+                    )
+                    ** 2,
+                ),
+            ),
+        ),
+    )
+
+    upper = (
+        estimate
+        + float(
+            np.sqrt(
+                np.sum(
+                    weights**2
+                    * (
+                        upper_array
+                        - rates
+                    )
+                    ** 2,
+                ),
+            ),
         )
-        non_overall = out.filter(pl.col("region") != "Overall")
-        assert non_overall["significance"].null_count() == 0
-        assert all(m != "" for m in non_overall["significance"].to_list())
+    )
 
-    def test_sparse_group_significance_within_valid_labels(self, sparse_prop_df):
-        out = directly_standardized_proportion_df(
-            sparse_prop_df, "event", ["band"], ["icb"]
+    return (
+        estimate,
+        lower,
+        upper,
+    )
+
+
+def get_row(
+    result: pl.DataFrame,
+    **filters: object,
+) -> dict[str, Any]:
+    """Return one output row matching the supplied values."""
+    filtered = result
+
+    for column, value in filters.items():
+        filtered = filtered.filter(
+            pl.col(column) == value,
         )
-        non_overall = out.filter(pl.col("icb") != "Overall")
-        assert set(non_overall["significance"].to_list()) <= {
-            "Higher", "Lower", "Not significant", "Not tested"
-        }
+
+    assert filtered.height == 1
+
+    return filtered.row(
+        0,
+        named=True,
+    )
 
 
-# ============================================================
-# directly_standardized_rate_df
-# ============================================================
-
-class TestDirectlyStandardizedRate:
-    def test_output_columns(self, simple_rate_df):
-        out = directly_standardized_rate_df(simple_rate_df, "events", ["sex", "age"], ["region"])
-        assert set(out.columns) == {
-            "region", "events", "denominator", "dsr", "dsr_lower", "dsr_upper",
-            "multiplier", "notes", "significance"
-        }
-
-    def test_row_count_includes_overall(self, simple_rate_df):
-        out = directly_standardized_rate_df(simple_rate_df, "events", ["sex", "age"], ["region"])
-        assert out.shape[0] == 5
-
-    def test_bounds_valid(self, simple_rate_df):
-        out = directly_standardized_rate_df(simple_rate_df, "events", ["sex", "age"], ["region"])
-        non_null = out.filter(pl.col("dsr").is_not_null())
-        assert (non_null["dsr_lower"] <= non_null["dsr"]).all()
-        assert (non_null["dsr"] <= non_null["dsr_upper"]).all()
-
-    def test_denominator_equals_row_count(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 40,
-            "strat": ["X"] * 20 + ["Y"] * 20,
-            "events": [1] * 20 + [2] * 20,
-        })
-        out = directly_standardized_rate_df(df, "events", ["strat"], ["grp"])
-        row = out.filter(pl.col("grp") == "A")
-        assert row["denominator"][0] == 40.0
-
-    def test_note_end_of_period_denominator(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 40,
-            "strat": ["X"] * 20 + ["Y"] * 20,
-            "events": [1] * 20 + [2] * 20,
-        })
-        out = directly_standardized_rate_df(df, "events", ["strat"], ["grp"])
-        row = out.filter(pl.col("grp") == "A")
-        assert "End-of-period denominator" in row["notes"][0]
-
-    def test_note_zero_events(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 40,
-            "strat": ["X"] * 20 + ["Y"] * 20,
-            "events": [0] * 40,
-        })
-        out = directly_standardized_rate_df(df, "events", ["strat"], ["grp"])
-        row = out.filter(pl.col("grp") == "A")
-        assert "Zero events" in row["notes"][0]
-
-    def test_note_haldane_applied(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 40,
-            "strat": ["X"] * 20 + ["Y"] * 20,
-            "events": [0] * 20 + [5] * 20,
-        })
-        out = directly_standardized_rate_df(df, "events", ["strat"], ["grp"])
-        row = out.filter(pl.col("grp") == "A")
-        assert "Haldane correction applied" in row["notes"][0]
-
-    def test_missing_column_raises(self, simple_rate_df):
-        with pytest.raises(ValueError):
-            directly_standardized_rate_df(
-                simple_rate_df, "missing", ["sex"], ["region"]
-            )
-
-    def test_extra_positional_arg_raises_typeerror(self, simple_rate_df):
-        with pytest.raises(TypeError):
-            directly_standardized_rate_df(
-                simple_rate_df, "events", ["sex"], ["region"], "some_denom_col", 100_000.0, 0.95, "extra"
-            )
+# ===========================================================================
+# Fixtures
+# ===========================================================================
 
 
-class TestDirectlyStandardizedRateSignificance:
-    def test_columns_present(self, simple_rate_df):
-        out = directly_standardized_rate_df(simple_rate_df, "events", ["sex", "age"], ["region"])
-        assert "significance" in out.columns
-
-    def test_overall_row_is_reference_and_unweighted_note(self, simple_rate_df):
-        out = directly_standardized_rate_df(simple_rate_df, "events", ["sex", "age"], ["region"])
-        overall = out.filter(pl.col("region") == "Overall")
-        assert overall["significance"][0] == "Reference"
-        assert "no weighting applied" in overall["notes"][0]
-
-    def test_overall_row_flags_end_of_period(self, simple_rate_df):
-        out = directly_standardized_rate_df(simple_rate_df, "events", ["sex", "age"], ["region"])
-        overall = out.filter(pl.col("region") == "Overall")
-        assert "End-of-period denominator" in overall["notes"][0]
-
-    def test_non_overall_rows_have_significance_label(self, simple_rate_df):
-        out = directly_standardized_rate_df(simple_rate_df, "events", ["sex", "age"], ["region"])
-        non_overall = out.filter(pl.col("region") != "Overall")
-        assert non_overall["significance"].null_count() == 0
-        assert all(m != "" for m in non_overall["significance"].to_list())
-
-    def test_sparse_group_significance_within_valid_labels(self, sparse_rate_df):
-        out = directly_standardized_rate_df(sparse_rate_df, "events", ["band"], ["icb"])
-        non_overall = out.filter(pl.col("icb") != "Overall")
-        assert set(non_overall["significance"].to_list()) <= {
-            "Higher", "Lower", "Not significant", "Not tested"
-        }
-
-
-# ============================================================
-# crude_rate_df: row-count denominator behaviour
-# ============================================================
-
-class TestCrudeRateDfRowCountDenominator:
-    def test_denominator_equals_row_count(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 20 + ["B"] * 20,
-            "events": [1] * 5 + [0] * 15 + [1] * 2 + [0] * 18,
-        })
-        out = crude_rate_df(df, "events", ["grp"])
-        row_a = out.filter(pl.col("grp") == "A")
-        assert row_a["denominator"][0] == 20.0
-
-    def test_note_end_of_period_denominator(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 20,
-            "events": [1] * 5 + [0] * 15,
-        })
-        out = crude_rate_df(df, "events", ["grp"])
-        row_a = out.filter(pl.col("grp") == "A")
-        assert "End-of-period denominator" in row_a["notes"][0]
-
-    def test_overall_row_flagged_too(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 20,
-            "events": [1] * 5 + [0] * 15,
-        })
-        out = crude_rate_df(df, "events", ["grp"])
-        overall = out.filter(pl.col("grp") == "Overall")
-        assert "End-of-period denominator" in overall["notes"][0]
-
-    def test_extra_positional_arg_raises_typeerror(self, simple_rate_df):
-        with pytest.raises(TypeError):
-            crude_rate_df(simple_rate_df, "events", ["region"], 100_000.0, 0.95, "extra")
-
-    def test_manual_person_time_replication_matches(self):
-        df_rowlevel = pl.DataFrame({
-            "grp": ["A"] * 20 + ["B"] * 20,
-            "events": [1] * 5 + [0] * 15 + [1] * 2 + [0] * 18,
-        })
-        out = crude_rate_df(df_rowlevel, "events", ["grp"])
-        row_a = out.filter(pl.col("grp") == "A")
-        expected_rate = (5.0 / 20.0) * 100_000.0
-        assert abs(row_a["rate"][0] - expected_rate) < 1e-6
-
-
-# ============================================================
-# Null/NA validation across numerator, strata, and group columns
-# ============================================================
-
-class TestNullValidation:
-    def test_null_in_event_col_raises_crude_proportion(self):
-        df = pl.DataFrame({
-            "grp": ["A", "A", "B", "B"],
-            "event": [1, None, 0, 1],
-        })
-        with pytest.raises(ValueError, match="Null/NA values"):
-            crude_proportion_df(df, "event", ["grp"])
-
-    def test_null_in_group_col_raises_crude_proportion(self):
-        df = pl.DataFrame({
-            "grp": ["A", None, "B", "B"],
-            "event": [1, 0, 0, 1],
-        })
-        with pytest.raises(ValueError, match="Null/NA values"):
-            crude_proportion_df(df, "event", ["grp"])
-
-    def test_null_in_event_col_raises_crude_rate(self):
-        df = pl.DataFrame({
-            "grp": ["A", "A", "B", "B"],
-            "events": [1, None, 0, 1],
-        })
-        with pytest.raises(ValueError, match="Null/NA values"):
-            crude_rate_df(df, "events", ["grp"])
-
-    def test_null_in_strata_col_raises_dsp(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 20 + ["B"] * 20,
-            "strat": (["X"] * 10 + [None] + ["X"] * 9) * 2,
-            "event": [1, 0] * 20,
-        })
-        with pytest.raises(ValueError, match="Null/NA values"):
-            directly_standardized_proportion_df(df, "event", ["strat"], ["grp"])
-
-    def test_null_in_strata_col_raises_dsr(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 20 + ["B"] * 20,
-            "strat": (["X"] * 10 + [None] + ["X"] * 9) * 2,
-            "events": [1, 0] * 20,
-        })
-        with pytest.raises(ValueError, match="Null/NA values"):
-            directly_standardized_rate_df(df, "events", ["strat"], ["grp"])
-
-    def test_null_in_group_col_raises_dsp(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 10 + [None] * 10 + ["B"] * 20,
-            "strat": ["X"] * 40,
-            "event": [1, 0] * 20,
-        })
-        with pytest.raises(ValueError, match="Null/NA values"):
-            directly_standardized_proportion_df(df, "event", ["strat"], ["grp"])
-
-    def test_error_lists_all_offending_columns(self):
-        df = pl.DataFrame({
-            "grp": ["A", None, "B", "B"],
-            "event": [1, None, 0, 1],
-        })
-        with pytest.raises(ValueError) as exc_info:
-            crude_proportion_df(df, "event", ["grp"])
-        msg = str(exc_info.value)
-        assert "event" in msg
-        assert "grp" in msg
-
-    def test_check_no_nulls_helper_directly(self):
-        df = pl.DataFrame({"a": [1, None, 3], "b": [1, 2, 3]})
-        with pytest.raises(ValueError, match="Null/NA values"):
-            _check_no_nulls(df, ["a", "b"])
-
-    def test_check_no_nulls_passes_when_clean(self):
-        df = pl.DataFrame({"a": [1, 2, 3], "b": [1, 2, 3]})
-        _check_no_nulls(df, ["a", "b"])  # should not raise
+@pytest.fixture
+def analytical_df() -> pl.DataFrame:
+    """Patient-level data containing valid inequality and hierarchy data."""
+    return pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+                1,
+                0,
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                0,
+                1,
+                0,
+            ],
+            "count": [
+                0,
+                1,
+                2,
+                0,
+                1,
+                3,
+                0,
+                1,
+                0,
+                2,
+                1,
+                4,
+                2,
+                0,
+                3,
+                1,
+            ],
+            "age_band": [
+                "Young",
+                "Young",
+                "Old",
+                "Old",
+                "Young",
+                "Young",
+                "Old",
+                "Old",
+                "Young",
+                "Young",
+                "Old",
+                "Old",
+                "Young",
+                "Young",
+                "Old",
+                "Old",
+            ],
+            "sex": [
+                "Female",
+                "Male",
+                "Female",
+                "Male",
+                "Female",
+                "Male",
+                "Female",
+                "Male",
+                "Female",
+                "Male",
+                "Female",
+                "Male",
+                "Female",
+                "Male",
+                "Female",
+                "Male",
+            ],
+            "ethnicity": [
+                "White",
+                "White",
+                "Other",
+                "Other",
+                "White",
+                "White",
+                "Other",
+                "Other",
+                "White",
+                "White",
+                "Other",
+                "Other",
+                "White",
+                "White",
+                "Other",
+                "Other",
+            ],
+            "region": [
+                *["East"] * 8,
+                *["West"] * 8,
+            ],
+            "icb": [
+                *["E1"] * 8,
+                *["W1"] * 8,
+            ],
+            "practice": [
+                *["P1"] * 4,
+                *["P2"] * 4,
+                *["P3"] * 4,
+                *["P4"] * 4,
+            ],
+        },
+    )
 
 
-# ============================================================
-# Numerator column type/value validation
-# ============================================================
-
-class TestNumeratorValidation:
-    def test_float_event_col_raises_crude_proportion(self):
-        df = pl.DataFrame({"grp": ["A", "B"], "event": [1.0, 0.0]})
-        with pytest.raises(ValueError, match="non-negative integer"):
-            crude_proportion_df(df, "event", ["grp"])
-
-    def test_string_event_col_raises_crude_rate(self):
-        df = pl.DataFrame({"grp": ["A", "B"], "events": ["1", "0"]})
-        with pytest.raises(ValueError, match="non-negative integer"):
-            crude_rate_df(df, "events", ["grp"])
-
-    def test_negative_integer_raises(self):
-        df = pl.DataFrame({"grp": ["A", "B"], "events": [-1, 2]})
-        with pytest.raises(ValueError, match="non-negative"):
-            crude_rate_df(df, "events", ["grp"])
-
-    def test_proportion_col_must_be_0_or_1(self):
-        df = pl.DataFrame({"grp": ["A", "B", "C"], "event": [0, 1, 2]})
-        with pytest.raises(ValueError, match="0 or 1"):
-            crude_proportion_df(df, "event", ["grp"])
-
-    def test_rate_col_allows_values_above_1(self):
-        df = pl.DataFrame({"grp": ["A", "B", "C"], "events": [0, 1, 5]})
-        out = crude_rate_df(df, "events", ["grp"])
-        assert out.shape[0] == 4
-
-    def test_boolean_event_col_accepted_for_proportion(self):
-        df = pl.DataFrame({"grp": ["A", "B"], "event": [True, False]})
-        out = crude_proportion_df(df, "event", ["grp"])
-        assert out.shape[0] == 3
-
-    def test_boolean_event_col_accepted_for_rate(self):
-        df = pl.DataFrame({"grp": ["A", "B"], "events": [True, False]})
-        out = crude_rate_df(df, "events", ["grp"])
-        assert out.shape[0] == 3
-
-    def test_dsp_rejects_non_binary_numerator(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 10 + ["B"] * 10,
-            "strat": ["X"] * 20,
-            "event": [0, 1, 2] * 6 + [0, 1],
-        })
-        with pytest.raises(ValueError, match="0 or 1"):
-            directly_standardized_proportion_df(df, "event", ["strat"], ["grp"])
-
-    def test_dsr_allows_multi_valued_integer_numerator(self):
-        df = pl.DataFrame({
-            "grp": ["A"] * 10 + ["B"] * 10,
-            "strat": ["X"] * 20,
-            "events": [0, 1, 2, 3] * 5,
-        })
-        out = directly_standardized_rate_df(df, "events", ["strat"], ["grp"])
-        assert out.shape[0] == 3
-
-    def test_validate_numerator_col_helper_negative(self):
-        df = pl.DataFrame({"events": [-5, 1, 2]})
-        with pytest.raises(ValueError, match="non-negative"):
-            _validate_numerator_col(df, "events", binary=False)
-
-    def test_validate_numerator_col_helper_float_dtype(self):
-        df = pl.DataFrame({"events": [1.5, 2.0, 3.0]})
-        with pytest.raises(ValueError, match="non-negative integer"):
-            _validate_numerator_col(df, "events", binary=True)
-
-    def test_validate_numerator_col_helper_binary_violation(self):
-        df = pl.DataFrame({"event": [0, 1, 2]})
-        with pytest.raises(ValueError, match="0 or 1"):
-            _validate_numerator_col(df, "event", binary=True)
+@pytest.fixture
+def missing_strata_df() -> pl.DataFrame:
+    """Data in which one comparison group has no observations in stratum B."""
+    return pl.DataFrame(
+        {
+            "event": [
+                0,
+                0,
+                1,
+                0,
+                1,
+                1,
+            ],
+            "count": [
+                0,
+                0,
+                1,
+                2,
+                1,
+                3,
+            ],
+            "age_band": [
+                "A",
+                "A",
+                "A",
+                "A",
+                "B",
+                "B",
+            ],
+            "group": [
+                "G1",
+                "G1",
+                "G2",
+                "G2",
+                "G2",
+                "G2",
+            ],
+        },
+    )
 
 
-class TestAdditionalCoverage:
-    def test_byar_count_ci_negative_raises(self):
-        with pytest.raises(ValueError, match="non-negative"):
-            _byar_count_ci(-1)
+# ===========================================================================
+# Package API
+# ===========================================================================
 
-    def test_bin_numeric_to_quartiles_handles_exception(self, monkeypatch):
-        class BrokenSeries(pl.Series):
-            def quantile(self, *a, **kw):
-                raise RuntimeError("boom")
-        s = BrokenSeries("x", [1, 2, 3])
-        out = _bin_numeric_to_quartiles(s)
-        assert out is s
 
-    def test_wilson_dobson_proportion_ci_zero_n_returns_nan(self):
-        result = _wilson_dobson_proportion_ci(
-            0.5, 5, 0, np.array([1.0]), np.array([0.5]), np.array([10.0])
+def test_package_exposes_public_functions() -> None:
+    """All documented functions are available from the package root."""
+    assert PUBLIC_NAMES <= set(package.__all__)
+
+    for name in PUBLIC_NAMES:
+        assert hasattr(package, name)
+        assert callable(getattr(package, name))
+
+
+def test_package_functions_match_core_exports() -> None:
+    """Package-level imports reference the expected functions."""
+    assert package.crude_proportion_df is crude_proportion_df
+    assert package.crude_rate_df is crude_rate_df
+
+    assert (
+        package.directly_standardized_proportion_df
+        is directly_standardized_proportion_df
+    )
+
+    assert (
+        package.directly_standardized_rate_df
+        is directly_standardized_rate_df
+    )
+
+
+# ===========================================================================
+# Statistical helper tests
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("events", "denominator"),
+    [
+        (0.0, 10.0),
+        (1.0, 10.0),
+        (5.0, 10.0),
+        (10.0, 10.0),
+    ],
+)
+def test_wilson_matches_reference(
+    events: float,
+    denominator: float,
+) -> None:
+    """Wilson limits match an independent implementation."""
+    expected_lower, expected_upper = (
+        reference_wilson(
+            events,
+            denominator,
         )
-        assert all(np.isnan(v) for v in result)
+    )
 
-    def test_wilson_dobson_proportion_ci_zero_weight_sum_returns_nan(self):
-        result = _wilson_dobson_proportion_ci(
-            0.5, 5, 10, np.array([0.0]), np.array([0.5]), np.array([10.0])
+    lower, upper, variance = (
+        _wilson_proportion_ci(
+            events,
+            denominator,
         )
-        assert all(np.isnan(v) for v in result)
+    )
 
-    def test_dobson_byar_rate_ci_negative_events_returns_nan(self):
-        result = _dobson_byar_rate_ci(
-            0.5, -1, np.array([1.0]), np.array([5.0]), np.array([10.0])
+    assert lower == pytest.approx(
+        expected_lower,
+    )
+
+    assert upper == pytest.approx(
+        expected_upper,
+    )
+
+    expected_proportion = events / denominator
+
+    assert variance == pytest.approx(
+        expected_proportion
+        * (1 - expected_proportion)
+        / denominator,
+    )
+
+
+def test_wilson_zero_denominator_returns_nan() -> None:
+    """A zero denominator has no estimable Wilson interval."""
+    lower, upper, variance = (
+        _wilson_proportion_ci(
+            0,
+            0,
         )
-        assert all(np.isnan(v) for v in result)
+    )
 
-    def test_dobson_byar_rate_ci_zero_weight_sum_returns_nan(self):
-        result = _dobson_byar_rate_ci(
-            0.5, 5, np.array([0.0]), np.array([5.0]), np.array([10.0])
+    assert np.isnan(lower)
+    assert np.isnan(upper)
+    assert np.isnan(variance)
+
+
+@pytest.mark.parametrize(
+    "count",
+    [
+        0.0,
+        1.0,
+        5.0,
+        9.0,
+    ],
+)
+def test_exact_poisson_matches_reference(
+    count: float,
+) -> None:
+    """Exact Poisson limits match the chi-square calculation."""
+    expected = reference_exact_poisson(
+        count,
+    )
+
+    actual = _exact_poisson_count_ci(
+        count,
+    )
+
+    assert actual[0] == pytest.approx(
+        expected[0],
+    )
+
+    assert actual[1] == pytest.approx(
+        expected[1],
+    )
+
+
+@pytest.mark.parametrize(
+    "count",
+    [
+        10.0,
+        20.0,
+        100.0,
+    ],
+)
+def test_byar_matches_reference(
+    count: float,
+) -> None:
+    """Byar limits match an independent implementation."""
+    expected = reference_byar(
+        count,
+    )
+
+    actual = _byar_count_ci(
+        count,
+    )
+
+    assert actual[0] == pytest.approx(
+        expected[0],
+    )
+
+    assert actual[1] == pytest.approx(
+        expected[1],
+    )
+
+
+@pytest.mark.parametrize(
+    "helper",
+    [
+        _exact_poisson_count_ci,
+        _byar_count_ci,
+    ],
+)
+def test_poisson_helpers_reject_negative_counts(
+    helper: Callable[..., tuple[float, float]],
+) -> None:
+    """Poisson interval helpers reject negative counts."""
+    with pytest.raises(
+        ValueError,
+        match="non-negative",
+    ):
+        helper(-1)
+
+
+def test_proportion_mover_matches_reference() -> None:
+    """Wilson-MOVER matches an independent calculation."""
+    weights = np.array(
+        [0.25, 0.75],
+    )
+
+    events = np.array(
+        [0.0, 8.0],
+    )
+
+    denominators = np.array(
+        [10.0, 10.0],
+    )
+
+    expected = reference_mover_proportion(
+        weights,
+        events,
+        denominators,
+    )
+
+    actual = _mover_weighted_proportion_ci(
+        weights,
+        events,
+        denominators,
+    )
+
+    assert actual == pytest.approx(
+        expected,
+    )
+
+
+def test_proportion_mover_zero_events_has_positive_upper_limit() -> None:
+    """Zero-event strata retain a zero estimate and positive upper limit."""
+    estimate, lower, upper = (
+        _mover_weighted_proportion_ci(
+            stratum_weights=np.array(
+                [0.5, 0.5],
+            ),
+            stratum_events=np.array(
+                [0.0, 0.0],
+            ),
+            stratum_ns=np.array(
+                [10.0, 20.0],
+            ),
         )
-        assert all(np.isnan(v) for v in result)
+    )
 
-    def test_significance_from_ci_not_tested_when_reference_nan(self):
-        label = _significance_from_ci(np.nan, 0.4, 0.6)
-        assert label == "Not tested"
+    assert estimate == 0
+    assert lower == 0
+    assert upper > 0
 
-    def test_crude_rate_df_empty_group_produces_overall_row(self):
-        df = pl.DataFrame({
-            "grp": pl.Series([], dtype=pl.Utf8),
-            "event": pl.Series([], dtype=pl.Int64),
-        })
-        out = crude_rate_df(df, "event", ["grp"])
-        assert out.shape[0] == 1
-        for col in ["events", "denominator", "rate", "significance"]:
-            assert col in out.columns
-        assert out["significance"][0] == "Reference"
 
-    def test_dsp_df_empty_input_produces_correct_schema(self):
-        df = pl.DataFrame({
-            "grp": pl.Series([], dtype=pl.Utf8),
-            "strat": pl.Series([], dtype=pl.Utf8),
-            "event": pl.Series([], dtype=pl.Int64),
-        })
-        out = directly_standardized_proportion_df(df, "event", ["strat"], ["grp"])
-        assert out.shape[0] == 1
+def test_proportion_mover_all_events_has_nonzero_lower_limit() -> None:
+    """All-event strata retain an estimate of one."""
+    estimate, lower, upper = (
+        _mover_weighted_proportion_ci(
+            stratum_weights=np.array(
+                [0.5, 0.5],
+            ),
+            stratum_events=np.array(
+                [10.0, 20.0],
+            ),
+            stratum_ns=np.array(
+                [10.0, 20.0],
+            ),
+        )
+    )
 
-    def test_dsr_df_empty_input_produces_overall_row(self):
-        df = pl.DataFrame({
-            "grp": pl.Series([], dtype=pl.Utf8),
-            "strat": pl.Series([], dtype=pl.Utf8),
-            "events": pl.Series([], dtype=pl.Int64),
-        })
-        out = directly_standardized_rate_df(df, "events", ["strat"], ["grp"])
-        assert out.shape[0] == 1
+    assert estimate == pytest.approx(1)
+    assert 0 < lower < 1
+    assert upper == pytest.approx(1)
+
+
+def test_rate_mover_matches_reference() -> None:
+    """Poisson-MOVER matches an independent calculation."""
+    weights = np.array(
+        [0.4, 0.6],
+    )
+
+    events = np.array(
+        [0.0, 20.0],
+    )
+
+    denominators = np.array(
+        [100.0, 200.0],
+    )
+
+    expected = reference_mover_rate(
+        weights,
+        events,
+        denominators,
+    )
+
+    actual = _mover_weighted_rate_ci(
+        weights,
+        events,
+        denominators,
+    )
+
+    assert actual == pytest.approx(
+        expected,
+    )
+
+
+def test_rate_mover_zero_events_has_positive_upper_limit() -> None:
+    """An all-zero DSR has a positive MOVER upper confidence limit."""
+    estimate, lower, upper = (
+        _mover_weighted_rate_ci(
+            stratum_weights=np.array(
+                [0.5, 0.5],
+            ),
+            stratum_events=np.array(
+                [0.0, 0.0],
+            ),
+            stratum_denominators=np.array(
+                [100.0, 200.0],
+            ),
+        )
+    )
+
+    assert estimate == 0
+    assert lower == 0
+    assert upper > 0
+
+
+@pytest.mark.parametrize(
+    (
+        "weights",
+        "events",
+        "denominators",
+        "message",
+    ),
+    [
+        (
+            np.array([-0.5, 1.5]),
+            np.array([1.0, 1.0]),
+            np.array([10.0, 10.0]),
+            "weights must be non-negative",
+        ),
+        (
+            np.array([0.5, 0.5]),
+            np.array([-1.0, 1.0]),
+            np.array([10.0, 10.0]),
+            "events must be non-negative",
+        ),
+        (
+            np.array([0.5, 0.5]),
+            np.array([1.0, 1.0]),
+            np.array([-10.0, 10.0]),
+            "denominators must be non-negative",
+        ),
+    ],
+)
+def test_rate_mover_rejects_invalid_inputs(
+    weights: np.ndarray,
+    events: np.ndarray,
+    denominators: np.ndarray,
+    message: str,
+) -> None:
+    """Poisson-MOVER validates weights, events and denominators."""
+    with pytest.raises(
+        ValueError,
+        match=message,
+    ):
+        _mover_weighted_rate_ci(
+            weights,
+            events,
+            denominators,
+        )
+
+
+def test_mover_rejects_different_array_lengths() -> None:
+    """MOVER inputs must have equal lengths."""
+    with pytest.raises(
+        ValueError,
+        match="equal lengths",
+    ):
+        _mover_weighted_proportion_ci(
+            stratum_weights=np.array(
+                [1.0],
+            ),
+            stratum_events=np.array(
+                [1.0, 2.0],
+            ),
+            stratum_ns=np.array(
+                [10.0],
+            ),
+        )
+
+
+def test_mover_rejects_non_vector_inputs() -> None:
+    """MOVER inputs must be one-dimensional."""
+    with pytest.raises(
+        ValueError,
+        match="one-dimensional",
+    ):
+        _mover_weighted_rate_ci(
+            stratum_weights=np.array(
+                [[1.0]],
+            ),
+            stratum_events=np.array(
+                [[1.0]],
+            ),
+            stratum_denominators=np.array(
+                [[10.0]],
+            ),
+        )
+
+
+# ===========================================================================
+# Grouping logic
+# ===========================================================================
+
+
+def test_inequality_states_form_complete_cube() -> None:
+    """Two inequality dimensions produce four marginal states."""
+    assert _inequality_states(
+        ["sex", "ethnicity"],
+    ) == [
+        (
+            "sex",
+            "ethnicity",
+        ),
+        ("sex",),
+        ("ethnicity",),
+        (),
+    ]
+
+
+def test_separate_organisational_states() -> None:
+    """Separate mode emits valid hierarchy prefixes."""
+    hierarchies = {
+        "geography": (
+            "region",
+            "icb",
+            "practice",
+        ),
+    }
+
+    assert _organisational_states(
+        hierarchies,
+        "separate",
+    ) == [
+        (
+            "region",
+            "icb",
+            "practice",
+        ),
+        (
+            "region",
+            "icb",
+        ),
+        ("region",),
+        (),
+    ]
+
+
+def test_cross_organisational_states() -> None:
+    """Cross mode intersects independently declared hierarchies."""
+    hierarchies = {
+        "geography": ("region",),
+        "provider": ("provider",),
+    }
+
+    assert _organisational_states(
+        hierarchies,
+        "cross",
+    ) == [
+        (
+            "region",
+            "provider",
+        ),
+        ("region",),
+        ("provider",),
+        (),
+    ]
+
+
+def test_grouping_sets_remove_duplicates() -> None:
+    """The grouping-set builder emits unique states."""
+    grouping_sets = _build_grouping_sets(
+        inequalities=["sex"],
+        hierarchies={
+            "geography": (
+                "region",
+                "icb",
+            ),
+        },
+        mode="separate",
+    )
+
+    active_states = [
+        grouping_set.active_cols
+        for grouping_set in grouping_sets
+    ]
+
+    assert len(active_states) == len(
+        set(active_states),
+    )
+
+    assert () in active_states
+
+    assert (
+        "region",
+        "icb",
+        "sex",
+    ) in active_states
+
+
+def test_normalise_hierarchies_accepts_valid_mapping() -> None:
+    """Hierarchy declarations are converted to tuples."""
+    result = _normalise_hierarchies(
+        {
+            "geography": [
+                "region",
+                "icb",
+            ],
+        },
+    )
+
+    assert result == {
+        "geography": (
+            "region",
+            "icb",
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ["region", "icb"],
+        "region",
+        12,
+    ],
+)
+def test_normalise_hierarchies_rejects_non_mapping(
+    value: object,
+) -> None:
+    """Organisational columns must be supplied as a named mapping."""
+    with pytest.raises(
+        TypeError,
+        match="named mapping",
+    ):
+        _normalise_hierarchies(value)  # type: ignore[arg-type]
+
+
+# ===========================================================================
+# Validation
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    "function,kwargs",
+    [
+        (
+            crude_proportion_df,
+            {
+                "event_col": "event",
+            },
+        ),
+        (
+            crude_rate_df,
+            {
+                "event_col": "event",
+            },
+        ),
+        (
+            directly_standardized_proportion_df,
+            {
+                "event_col": "event",
+                "strata_cols": ["age"],
+            },
+        ),
+        (
+            directly_standardized_rate_df,
+            {
+                "event_col": "event",
+                "strata_cols": ["age"],
+            },
+        ),
+    ],
+)
+def test_public_functions_reject_empty_dataframes(
+    function: Callable[..., pl.DataFrame],
+    kwargs: dict[str, object],
+) -> None:
+    """All public functions reject empty dataframes consistently."""
+    df = pl.DataFrame(
+        {
+            "event": pl.Series(
+                [],
+                dtype=pl.Int64,
+            ),
+            "age": pl.Series(
+                [],
+                dtype=pl.String,
+            ),
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="at least one row",
+    ):
+        function(
+            df,
+            **kwargs,
+        )
+
+
+def test_public_function_requires_polars_dataframe() -> None:
+    """Non-Polars inputs receive a clear type error."""
+    with pytest.raises(
+        TypeError,
+        match="Polars DataFrame",
+    ):
+        crude_proportion_df(  # type: ignore[arg-type]
+            {
+                "event": [
+                    0,
+                    1,
+                ],
+            },
+            event_col="event",
+        )
+
+
+def test_missing_required_column_is_rejected() -> None:
+    """Missing analytical columns are reported."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="group",
+    ):
+        crude_proportion_df(
+            df,
+            event_col="event",
+            inequalities_cols=["group"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        (
+            [1.0, None],
+            "null",
+        ),
+        (
+            [1.0, float("nan")],
+            "NaN",
+        ),
+        (
+            [1.0, float("inf")],
+            "infinite",
+        ),
+        (
+            [1.0, float("-inf")],
+            "infinite",
+        ),
+    ],
+)
+def test_missing_and_nonfinite_values_are_rejected(
+    values: list[float | None],
+    message: str,
+) -> None:
+    """Null, NaN and infinite grouping values are rejected."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+            ],
+            "group": values,
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=message,
+    ):
+        crude_proportion_df(
+            df,
+            event_col="event",
+            inequalities_cols=["group"],
+        )
+
+
+def test_nonfinite_stratum_is_rejected() -> None:
+    """Non-finite values in standardisation strata are rejected."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+            ],
+            "age": [
+                20.0,
+                float("nan"),
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="NaN",
+    ):
+        directly_standardized_proportion_df(
+            df,
+            event_col="event",
+            strata_cols=["age"],
+        )
+
+
+def test_missing_helper_reports_multiple_problem_types() -> None:
+    """The missing-value helper reports all offending value types."""
+    df = pl.DataFrame(
+        {
+            "value": [
+                None,
+                float("nan"),
+                float("inf"),
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+    ) as error:
+        _check_no_missing_or_nonfinite(
+            df,
+            ["value"],
+        )
+
+    message = str(error.value)
+
+    assert "null" in message
+    assert "NaN" in message
+    assert "infinite" in message
+
+
+def test_negative_rate_numerator_is_rejected() -> None:
+    """Rate events must be non-negative."""
+    df = pl.DataFrame(
+        {
+            "count": [
+                1,
+                -1,
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="non-negative",
+    ):
+        crude_rate_df(
+            df,
+            event_col="count",
+        )
+
+
+def test_nonbinary_proportion_numerator_is_rejected() -> None:
+    """Proportion events must contain only zero and one."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                2,
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="only 0 or 1",
+    ):
+        crude_proportion_df(
+            df,
+            event_col="event",
+        )
+
+
+def test_float_numerator_is_rejected() -> None:
+    """Numerators must use an integer or Boolean dtype."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0.0,
+                1.0,
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="integer",
+    ):
+        crude_proportion_df(
+            df,
+            event_col="event",
+        )
+
+
+def test_boolean_numerator_is_accepted() -> None:
+    """Boolean proportion numerators are converted to integers."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                True,
+                False,
+                True,
+            ],
+        },
+    )
+
+    result = crude_proportion_df(
+        df,
+        event_col="event",
+    )
+
+    row = result.row(
+        0,
+        named=True,
+    )
+
+    assert row["events"] == 2
+    assert row["n"] == 3
+    assert row["proportion"] == pytest.approx(
+        2 / 3,
+    )
+
+
+@pytest.mark.parametrize(
+    "confidence",
+    [
+        "0.95",
+        True,
+        complex(
+            0.95,
+            0,
+        ),
+    ],
+)
+def test_confidence_rejects_invalid_types(
+    confidence: object,
+) -> None:
+    """Confidence rejects non-real and Boolean values."""
+    with pytest.raises(
+        TypeError,
+        match="real numeric",
+    ):
+        _validate_options(
+            confidence,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "confidence",
+    [
+        0.0,
+        1.0,
+        -0.5,
+        1.5,
+        float("nan"),
+        float("inf"),
+    ],
+)
+def test_confidence_rejects_invalid_values(
+    confidence: float,
+) -> None:
+    """Confidence must be finite and strictly between zero and one."""
+    with pytest.raises(
+        ValueError,
+        match="strictly between",
+    ):
+        _validate_options(
+            confidence,
+        )
+
+
+@pytest.mark.parametrize(
+    "multiplier",
+    [
+        "100000",
+        True,
+        complex(
+            100_000,
+            0,
+        ),
+    ],
+)
+def test_multiplier_rejects_invalid_types(
+    multiplier: object,
+) -> None:
+    """Multiplier rejects non-real and Boolean values."""
+    with pytest.raises(
+        TypeError,
+        match="real numeric",
+    ):
+        _validate_options(
+            0.95,
+            multiplier,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "multiplier",
+    [
+        0.0,
+        -1.0,
+        float("nan"),
+        float("inf"),
+    ],
+)
+def test_multiplier_rejects_invalid_values(
+    multiplier: float,
+) -> None:
+    """Multiplier must be finite and positive."""
+    with pytest.raises(
+        ValueError,
+        match="finite and positive",
+    ):
+        _validate_options(
+            0.95,
+            multiplier,
+        )
+
+
+def test_numpy_real_options_are_accepted() -> None:
+    """NumPy real scalar values pass option validation."""
+    _validate_options(
+        np.float64(0.95),
+        np.float64(100_000),
+    )
+
+
+@pytest.mark.parametrize(
+    "strata",
+    [
+        "age",
+        b"age",
+    ],
+)
+def test_strata_reject_single_string(
+    strata: object,
+) -> None:
+    """strata_cols must be a sequence rather than one string."""
+    with pytest.raises(
+        TypeError,
+        match="sequence",
+    ):
+        _validate_strata_cols(
+            strata,  # type: ignore[arg-type]
+        )
+
+
+def test_strata_reject_empty_sequence() -> None:
+    """At least one standardisation stratum is required."""
+    with pytest.raises(
+        ValueError,
+        match="at least one",
+    ):
+        _validate_strata_cols(
+            [],
+        )
+
+
+@pytest.mark.parametrize(
+    "reserved_name",
+    [
+        "events",
+        "n",
+        "notes",
+        "significance",
+        "ref_weight",
+        "dsp",
+        "dsr",
+    ],
+)
+def test_reserved_dimension_names_are_rejected(
+    reserved_name: str,
+) -> None:
+    """Grouping dimensions cannot collide with output columns."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+            ],
+            reserved_name: [
+                "A",
+                "B",
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="reserved analysis",
+    ):
+        crude_proportion_df(
+            df,
+            event_col="event",
+            inequalities_cols=[
+                reserved_name,
+            ],
+        )
+
+
+def test_reserved_stratum_name_is_rejected() -> None:
+    """Standardisation strata cannot collide with generated columns."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+            ],
+            "ref_weight": [
+                "A",
+                "B",
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="reserved analysis",
+    ):
+        directly_standardized_proportion_df(
+            df,
+            event_col="event",
+            strata_cols=["ref_weight"],
+        )
+
+
+def test_internal_denominator_is_not_overwritten() -> None:
+    """Rate functions protect the internal denominator column."""
+    df = pl.DataFrame(
+        {
+            "count": [
+                1,
+                2,
+            ],
+            _DENOM_COL: [
+                10.0,
+                10.0,
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="already contains",
+    ):
+        crude_rate_df(
+            df,
+            event_col="count",
+        )
+
+
+def test_inequality_and_organisation_overlap_is_rejected() -> None:
+    """A column cannot be both an inequality and organisation."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+            ],
+            "region": [
+                "A",
+                "B",
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="both inequality and organisational",
+    ):
+        crude_proportion_df(
+            df,
+            event_col="event",
+            inequalities_cols=["region"],
+            organisational_cols={
+                "geography": ["region"],
+            },
+        )
+
+
+def test_stratum_and_dimension_overlap_is_rejected() -> None:
+    """A stratum cannot also be an output grouping dimension."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+            ],
+            "age": [
+                "A",
+                "B",
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Strata cannot also",
+    ):
+        directly_standardized_proportion_df(
+            df,
+            event_col="event",
+            strata_cols=["age"],
+            inequalities_cols=["age"],
+        )
+
+
+def test_event_and_dimension_overlap_is_rejected() -> None:
+    """The numerator cannot also be a grouping dimension."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="event_col cannot",
+    ):
+        crude_proportion_df(
+            df,
+            event_col="event",
+            inequalities_cols=["event"],
+        )
+
+
+def test_all_label_collision_is_rejected() -> None:
+    """Observed dimension values cannot equal the reserved all label."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+            ],
+            "group": [
+                "All",
+                "B",
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Reserved all_label",
+    ):
+        crude_proportion_df(
+            df,
+            event_col="event",
+            inequalities_cols=["group"],
+        )
+
+
+def test_invalid_hierarchy_is_rejected() -> None:
+    """A child organisation cannot map to multiple parents."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+            ],
+            "region": [
+                "R1",
+                "R2",
+            ],
+            "practice": [
+                "P1",
+                "P1",
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="does not map to exactly one",
+    ):
+        crude_proportion_df(
+            df,
+            event_col="event",
+            organisational_cols={
+                "geography": [
+                    "region",
+                    "practice",
+                ],
+            },
+        )
+
+
+def test_invalid_organisational_mode_is_rejected() -> None:
+    """Only separate and cross organisational modes are valid."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="separate.*cross",
+    ):
+        crude_proportion_df(
+            df,
+            event_col="event",
+            organisational_mode="invalid",  # type: ignore[arg-type]
+        )
+
+
+# ===========================================================================
+# Data preparation
+# ===========================================================================
+
+
+def test_numeric_strata_are_converted_to_quartiles() -> None:
+    """Numeric standardisation strata are binned into Q1-Q4."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+                0,
+                1,
+                0,
+                1,
+                0,
+                1,
+            ],
+            "age": [
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+            ],
+        },
+    )
+
+    prepared = _prepare_dataframe_proportion(
+        df=df,
+        event_col="event",
+        strata_cols=["age"],
+        inequalities_cols=[],
+        organisational_cols={},
+    )
+
+    assert prepared.schema["age"] == pl.String
+
+    assert set(
+        prepared["age"].unique().to_list(),
+    ) == {
+        "Q1",
+        "Q2",
+        "Q3",
+        "Q4",
+    }
+
+
+def test_rate_preparation_allows_counts_above_one() -> None:
+    """Rate preparation accepts recurrent event counts."""
+    df = pl.DataFrame(
+        {
+            "count": [
+                0,
+                2,
+                4,
+                1,
+            ],
+            "age": [
+                "A",
+                "A",
+                "B",
+                "B",
+            ],
+        },
+    )
+
+    prepared = _prepare_dataframe_rate(
+        df=df,
+        event_col="count",
+        strata_cols=["age"],
+        inequalities_cols=[],
+        organisational_cols={},
+    )
+
+    assert prepared["count"].to_list() == [
+        0,
+        2,
+        4,
+        1,
+    ]
+
+
+def test_end_of_period_denominator_contains_ones() -> None:
+    """Each input row contributes one denominator unit."""
+    df = pl.DataFrame(
+        {
+            "count": [
+                1,
+                2,
+                3,
+            ],
+        },
+    )
+
+    result = _add_end_of_period_denominator(
+        df,
+    )
+
+    assert result[_DENOM_COL].to_list() == [
+        1.0,
+        1.0,
+        1.0,
+    ]
+
+
+def test_numeric_dimensions_are_cast_to_strings() -> None:
+    """Numeric inequality dimensions support the string all label."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+                0,
+                1,
+            ],
+            "code": [
+                1,
+                1,
+                2,
+                2,
+            ],
+        },
+    )
+
+    result = crude_proportion_df(
+        df,
+        event_col="event",
+        inequalities_cols=["code"],
+    )
+
+    assert result.schema["code"] == pl.String
+
+    assert set(
+        result["code"].to_list(),
+    ) == {
+        "1",
+        "2",
+        "All",
+    }
+
+
+# ===========================================================================
+# Crude proportions
+# ===========================================================================
+
+
+def test_crude_proportion_point_estimate_and_interval() -> None:
+    """The crude proportion uses the observed estimate and Wilson limits."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+                1,
+                0,
+            ],
+        },
+    )
+
+    result = crude_proportion_df(
+        df,
+        event_col="event",
+    )
+
+    row = result.row(
+        0,
+        named=True,
+    )
+
+    expected_lower, expected_upper = (
+        reference_wilson(
+            2,
+            4,
+        )
+    )
+
+    assert row["events"] == 2
+    assert row["n"] == 4
+    assert row["proportion"] == pytest.approx(0.5)
+
+    assert row["lower"] == pytest.approx(
+        expected_lower,
+    )
+
+    assert row["upper"] == pytest.approx(
+        expected_upper,
+    )
+
+    assert row["method"] == "Wilson score"
+    assert row["confidence"] == pytest.approx(0.95)
+    assert row["significance"] == "Reference"
+
+
+@pytest.mark.parametrize(
+    ("events", "expected"),
+    [
+        (
+            [0] * 10,
+            0.0,
+        ),
+        (
+            [1] * 10,
+            1.0,
+        ),
+    ],
+)
+def test_crude_proportion_boundary_estimates(
+    events: list[int],
+    expected: float,
+) -> None:
+    """Wilson intervals remain informative at zero and one."""
+    result = crude_proportion_df(
+        pl.DataFrame(
+            {
+                "event": events,
+            },
+        ),
+        event_col="event",
+    )
+
+    row = result.row(
+        0,
+        named=True,
+    )
+
+    assert row["proportion"] == expected
+    assert row["lower"] <= expected
+    assert row["upper"] >= expected
+    assert row["upper"] > row["lower"]
+
+
+def test_crude_proportion_significance_labels() -> None:
+    """Groups are classified relative to the fixed overall reference."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                *[1] * 20,
+                *[0] * 80,
+            ],
+            "group": [
+                *["A"] * 20,
+                *["B"] * 80,
+            ],
+        },
+    )
+
+    result = crude_proportion_df(
+        df,
+        event_col="event",
+        inequalities_cols=["group"],
+    )
+
+    assert get_row(
+        result,
+        group="A",
+    )["significance"] == "Higher"
+
+    assert get_row(
+        result,
+        group="B",
+    )["significance"] == "Lower"
+
+    assert get_row(
+        result,
+        group="All",
+    )["significance"] == "Reference"
+
+
+def test_crude_proportion_output_schema() -> None:
+    """Crude proportion output contains its documented metadata."""
+    result = crude_proportion_df(
+        pl.DataFrame(
+            {
+                "event": [
+                    0,
+                    1,
+                ],
+            },
+        ),
+        event_col="event",
+    )
+
+    assert result.columns == [
+        "events",
+        "n",
+        "proportion",
+        "lower",
+        "upper",
+        "confidence",
+        "method",
+        "notes",
+        "significance",
+    ]
+
+
+# ===========================================================================
+# Crude rates
+# ===========================================================================
+
+
+def test_crude_rate_uses_exact_interval_below_ten() -> None:
+    """Crude rates use exact Poisson limits below ten events."""
+    df = pl.DataFrame(
+        {
+            "count": [
+                1,
+                0,
+                2,
+            ],
+        },
+    )
+
+    result = crude_rate_df(
+        df,
+        event_col="count",
+        multiplier=1_000,
+    )
+
+    row = result.row(
+        0,
+        named=True,
+    )
+
+    expected_lower, expected_upper = (
+        reference_exact_poisson(
+            3,
+        )
+    )
+
+    assert row["events"] == 3
+    assert row["denominator"] == 3
+    assert row["rate"] == pytest.approx(
+        1_000,
+    )
+
+    assert row["lower"] == pytest.approx(
+        expected_lower
+        / 3
+        * 1_000,
+    )
+
+    assert row["upper"] == pytest.approx(
+        expected_upper
+        / 3
+        * 1_000,
+    )
+
+    assert row["method"] == "Exact chi-square"
+
+
+def test_crude_rate_uses_byar_from_ten_events() -> None:
+    """Crude rates use Byar limits from ten events."""
+    df = pl.DataFrame(
+        {
+            "count": [
+                1,
+            ]
+            * 10,
+        },
+    )
+
+    result = crude_rate_df(
+        df,
+        event_col="count",
+        multiplier=1_000,
+    )
+
+    row = result.row(
+        0,
+        named=True,
+    )
+
+    expected_lower, expected_upper = (
+        reference_byar(
+            10,
+        )
+    )
+
+    assert row["rate"] == pytest.approx(
+        1_000,
+    )
+
+    assert row["lower"] == pytest.approx(
+        expected_lower
+        / 10
+        * 1_000,
+    )
+
+    assert row["upper"] == pytest.approx(
+        expected_upper
+        / 10
+        * 1_000,
+    )
+
+    assert row["method"] == "Byar"
+
+
+def test_crude_rate_zero_events_has_positive_upper_limit() -> None:
+    """A zero crude rate retains an exact positive upper limit."""
+    result = crude_rate_df(
+        pl.DataFrame(
+            {
+                "count": [
+                    0,
+                    0,
+                    0,
+                ],
+            },
+        ),
+        event_col="count",
+    )
+
+    row = result.row(
+        0,
+        named=True,
+    )
+
+    assert row["rate"] == 0
+    assert row["lower"] == 0
+    assert row["upper"] > 0
+    assert "Zero events" in row["notes"]
+
+
+def test_crude_rate_records_denominator_assumption() -> None:
+    """Rate notes document the row-count exposure assumption."""
+    result = crude_rate_df(
+        pl.DataFrame(
+            {
+                "count": [
+                    0,
+                    1,
+                ],
+            },
+        ),
+        event_col="count",
+    )
+
+    row = result.row(
+        0,
+        named=True,
+    )
+
+    assert "End-of-period denominator" in row["notes"]
+
+
+def test_crude_rate_output_schema() -> None:
+    """Crude rate output contains method and scaling metadata."""
+    result = crude_rate_df(
+        pl.DataFrame(
+            {
+                "count": [
+                    0,
+                    1,
+                ],
+            },
+        ),
+        event_col="count",
+    )
+
+    assert result.columns == [
+        "events",
+        "denominator",
+        "rate",
+        "lower",
+        "upper",
+        "multiplier",
+        "confidence",
+        "method",
+        "notes",
+        "significance",
+    ]
+
+
+# ===========================================================================
+# Organisational and inequality outputs
+# ===========================================================================
+
+
+def test_complete_inequality_cube(
+    analytical_df: pl.DataFrame,
+) -> None:
+    """Two fully crossed inequalities produce nine output rows."""
+    result = crude_proportion_df(
+        analytical_df,
+        event_col="event",
+        inequalities_cols=[
+            "sex",
+            "ethnicity",
+        ],
+    )
+
+    assert result.height == 9
+
+    assert get_row(
+        result,
+        sex="All",
+        ethnicity="All",
+    )["significance"] == "Reference"
+
+
+def test_organisational_hierarchy_rollups(
+    analytical_df: pl.DataFrame,
+) -> None:
+    """A three-level hierarchy produces valid prefix roll-ups."""
+    result = crude_proportion_df(
+        analytical_df,
+        event_col="event",
+        organisational_cols={
+            "geography": [
+                "region",
+                "icb",
+                "practice",
+            ],
+        },
+    )
+
+    assert result.height == 9
+
+    assert result.filter(
+        (pl.col("practice") != "All")
+    ).height == 4
+
+    assert result.filter(
+        (pl.col("icb") != "All")
+        & (pl.col("practice") == "All")
+    ).height == 2
+
+    assert result.filter(
+        (pl.col("region") != "All")
+        & (pl.col("icb") == "All")
+        & (pl.col("practice") == "All")
+    ).height == 2
+
+
+def test_separate_and_cross_organisational_modes() -> None:
+    """Cross mode emits intersections across independent hierarchies."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+                0,
+                1,
+            ],
+            "region": [
+                "R1",
+                "R1",
+                "R2",
+                "R2",
+            ],
+            "provider": [
+                "A",
+                "B",
+                "A",
+                "B",
+            ],
+        },
+    )
+
+    hierarchies = {
+        "geography": ["region"],
+        "provider": ["provider"],
+    }
+
+    separate = crude_proportion_df(
+        df,
+        event_col="event",
+        organisational_cols=hierarchies,
+        organisational_mode="separate",
+    )
+
+    crossed = crude_proportion_df(
+        df,
+        event_col="event",
+        organisational_cols=hierarchies,
+        organisational_mode="cross",
+    )
+
+    assert separate.height == 5
+    assert crossed.height == 9
+
+
+# ===========================================================================
+# Directly standardised proportions
+# ===========================================================================
+
+
+def test_dsp_matches_independent_mover_calculation() -> None:
+    """The public DSP matches an independent Wilson-MOVER calculation."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+                0,
+            ],
+            "age_band": [
+                *["A"] * 4,
+                *["B"] * 4,
+            ],
+        },
+    )
+
+    result = directly_standardized_proportion_df(
+        df,
+        event_col="event",
+        strata_cols=["age_band"],
+    )
+
+    row = result.row(
+        0,
+        named=True,
+    )
+
+    expected = reference_mover_proportion(
+        weights=np.array(
+            [0.5, 0.5],
+        ),
+        events=np.array(
+            [1.0, 3.0],
+        ),
+        denominators=np.array(
+            [4.0, 4.0],
+        ),
+    )
+
+    assert row["dsp"] == pytest.approx(
+        expected[0],
+        abs=1e-6,
+    )
+
+    assert row["dsp_lower"] == pytest.approx(
+        expected[1],
+        abs=1e-6,
+    )
+
+    assert row["dsp_upper"] == pytest.approx(
+        expected[2],
+        abs=1e-6,
+    )
+
+    assert row["method"] == "Wilson-MOVER"
+    assert row["significance"] == "Reference"
+
+
+def test_dsp_missing_stratum_is_renormalised_and_noted(
+    missing_strata_df: pl.DataFrame,
+) -> None:
+    """Missing DSP strata are omitted and remaining weights renormalised."""
+    result = directly_standardized_proportion_df(
+        missing_strata_df,
+        event_col="event",
+        strata_cols=["age_band"],
+        inequalities_cols=["group"],
+    )
+
+    row = get_row(
+        result,
+        group="G1",
+    )
+
+    assert row["dsp"] == 0
+    assert row["dsp_upper"] > 0
+
+    assert (
+        "Calculated with missing standardisation stratum"
+        in row["notes"]
+    )
+
+    assert "33.3%" in row["notes"]
+    assert "renormalised" in row["notes"]
+
+
+def test_dsp_reference_equals_overall_observed_proportion(
+    missing_strata_df: pl.DataFrame,
+) -> None:
+    """Internal reference weights reproduce the overall proportion."""
+    result = directly_standardized_proportion_df(
+        missing_strata_df,
+        event_col="event",
+        strata_cols=["age_band"],
+        inequalities_cols=["group"],
+    )
+
+    reference = get_row(
+        result,
+        group="All",
+    )
+
+    assert reference["dsp"] == pytest.approx(
+        3 / 6,
+    )
+
+    assert reference["significance"] == "Reference"
+    assert "Reference population" in reference["notes"]
+
+
+def test_dsp_zero_events_is_not_haldane_corrected() -> None:
+    """A zero-event population retains a DSP point estimate of zero."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                0,
+                0,
+                0,
+            ],
+            "age_band": [
+                "A",
+                "A",
+                "B",
+                "B",
+            ],
+        },
+    )
+
+    result = directly_standardized_proportion_df(
+        df,
+        event_col="event",
+        strata_cols=["age_band"],
+    )
+
+    row = result.row(
+        0,
+        named=True,
+    )
+
+    assert row["dsp"] == 0
+    assert row["dsp_lower"] == 0
+    assert row["dsp_upper"] > 0
+    assert "Haldane" not in row["notes"]
+
+
+def test_dsp_all_events_retains_estimate_one() -> None:
+    """A population containing only events retains a DSP of one."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                1,
+                1,
+                1,
+                1,
+            ],
+            "age_band": [
+                "A",
+                "A",
+                "B",
+                "B",
+            ],
+        },
+    )
+
+    result = directly_standardized_proportion_df(
+        df,
+        event_col="event",
+        strata_cols=["age_band"],
+    )
+
+    row = result.row(
+        0,
+        named=True,
+    )
+
+    assert row["dsp"] == 1
+    assert row["dsp_lower"] < 1
+    assert row["dsp_upper"] == 1
+
+
+def test_dsp_stratum_helper_reports_missing_weight(
+    missing_strata_df: pl.DataFrame,
+) -> None:
+    """The DSP helper returns missing-stratum metadata."""
+    reference_weights = pl.DataFrame(
+        {
+            "age_band": [
+                "A",
+                "B",
+            ],
+            "ref_count": [
+                4,
+                2,
+            ],
+            "ref_weight": [
+                4 / 6,
+                2 / 6,
+            ],
+        },
+    )
+
+    group = missing_strata_df.filter(
+        pl.col("group") == "G1",
+    )
+
+    result = _compute_proportion_stratum_stats(
+        group_data=group,
+        all_strata=reference_weights.select(
+            "age_band",
+        ),
+        event_col="event",
+        strata_cols=["age_band"],
+        reference_weights=reference_weights,
+    )
+
+    assert result["missing_strata_count"] == 1
+
+    assert result[
+        "missing_reference_weight"
+    ] == pytest.approx(
+        1 / 3,
+    )
+
+    assert result[
+        "observed_reference_weight"
+    ] == pytest.approx(
+        2 / 3,
+    )
+
+    assert np.sum(
+        result["normalised_weights"],
+    ) == pytest.approx(1)
+
+
+def test_dsp_output_schema() -> None:
+    """DSP output reports interval methodology and confidence."""
+    df = pl.DataFrame(
+        {
+            "event": [
+                0,
+                1,
+            ],
+            "age_band": [
+                "A",
+                "B",
+            ],
+        },
+    )
+
+    result = directly_standardized_proportion_df(
+        df,
+        event_col="event",
+        strata_cols=["age_band"],
+    )
+
+    assert result.columns == [
+        "events",
+        "n",
+        "dsp",
+        "dsp_lower",
+        "dsp_upper",
+        "confidence",
+        "method",
+        "notes",
+        "significance",
+    ]
+
+
+# ===========================================================================
+# Directly standardised rates
+# ===========================================================================
+
+
+def test_dsr_matches_independent_mover_calculation() -> None:
+    """The public DSR matches an independent Poisson-MOVER calculation."""
+    df = pl.DataFrame(
+        {
+            "count": [
+                1,
+                1,
+                1,
+                1,
+                3,
+                3,
+                3,
+                3,
+            ],
+            "age_band": [
+                *["A"] * 4,
+                *["B"] * 4,
+            ],
+        },
+    )
+
+    multiplier = 1_000.0
+
+    result = directly_standardized_rate_df(
+        df,
+        event_col="count",
+        strata_cols=["age_band"],
+        multiplier=multiplier,
+    )
+
+    row = result.row(
+        0,
+        named=True,
+    )
+
+    expected = reference_mover_rate(
+        weights=np.array(
+            [0.5, 0.5],
+        ),
+        events=np.array(
+            [4.0, 12.0],
+        ),
+        denominators=np.array(
+            [4.0, 4.0],
+        ),
+    )
+
+    assert row["dsr"] == pytest.approx(
+        expected[0] * multiplier,
+        abs=1e-6,
+    )
+
+    assert row["dsr_lower"] == pytest.approx(
+        expected[1] * multiplier,
+        abs=1e-6,
+    )
+
+    assert row["dsr_upper"] == pytest.approx(
+        expected[2] * multiplier,
+        abs=1e-6,
+    )
+
+    assert (
+        row["method"]
+        == "Poisson-MOVER using exact and Byar stratum intervals"
+    )
+
+
+def test_dsr_missing_stratum_is_renormalised_and_noted(
+    missing_strata_df: pl.DataFrame,
+) -> None:
+    """Missing DSR strata are omitted and remaining weights renormalised."""
+    result = directly_standardized_rate_df(
+        missing_strata_df,
+        event_col="count",
+        strata_cols=["age_band"],
+        inequalities_cols=["group"],
+        multiplier=1_000,
+    )
+
+    row = get_row(
+        result,
+        group="G1",
+    )
+
+    assert row["dsr"] == 0
+    assert row["dsr_lower"] == 0
+    assert row["dsr_upper"] > 0
+
+    assert (
+        "Calculated with missing standardisation stratum"
+        in row["notes"]
+    )
+
+    assert "33.3%" in row["notes"]
+    assert "renormalised" in row["notes"]
+
+
+def test_dsr_zero_events_is_not_haldane_corrected() -> None:
+    """A zero-event population retains a DSR point estimate of zero."""
+    df = pl.DataFrame(
+        {
+            "count": [
+                0,
+                0,
+                0,
+                0,
+            ],
+            "age_band": [
+                "A",
+                "A",
+                "B",
+                "B",
+            ],
+        },
+    )
+
+    result = directly_standardized_rate_df(
+        df,
+        event_col="count",
+        strata_cols=["age_band"],
+    )
+
+    row = result.row(
+        0,
+        named=True,
+    )
+
+    assert row["dsr"] == 0
+    assert row["dsr_lower"] == 0
+    assert row["dsr_upper"] > 0
+    assert "Haldane" not in row["notes"]
+    assert "Zero total events" in row["notes"]
+
+
+def test_dsr_below_ten_events_is_returned_but_flagged() -> None:
+    """Low-count DSRs are calculated rather than suppressed."""
+    df = pl.DataFrame(
+        {
+            "count": [
+                0,
+                1,
+                0,
+                1,
+            ],
+            "age_band": [
+                "A",
+                "A",
+                "B",
+                "B",
+            ],
+        },
+    )
+
+    result = directly_standardized_rate_df(
+        df,
+        event_col="count",
+        strata_cols=["age_band"],
+    )
+
+    row = result.row(
+        0,
+        named=True,
+    )
+
+    assert np.isfinite(row["dsr"])
+    assert np.isfinite(row["dsr_lower"])
+    assert np.isfinite(row["dsr_upper"])
+
+    assert (
+        "Low total event count (<10)"
+        in row["notes"]
+    )
+
+
+def test_dsr_reference_equals_overall_crude_rate(
+    missing_strata_df: pl.DataFrame,
+) -> None:
+    """Internal weights reproduce the overall rate for the reference row."""
+    result = directly_standardized_rate_df(
+        missing_strata_df,
+        event_col="count",
+        strata_cols=["age_band"],
+        inequalities_cols=["group"],
+        multiplier=1_000,
+    )
+
+    reference = get_row(
+        result,
+        group="All",
+    )
+
+    expected = sum(
+        missing_strata_df["count"],
+    ) / missing_strata_df.height * 1_000
+
+    assert reference["dsr"] == pytest.approx(
+        expected,
+    )
+
+    assert reference["significance"] == "Reference"
+    assert "Reference population" in reference["notes"]
+
+
+def test_dsr_stratum_helper_reports_missing_weight(
+    missing_strata_df: pl.DataFrame,
+) -> None:
+    """The DSR helper returns missing-stratum metadata."""
+    working = _add_end_of_period_denominator(
+        missing_strata_df,
+    )
+
+    reference_weights = pl.DataFrame(
+        {
+            "age_band": [
+                "A",
+                "B",
+            ],
+            "ref_count": [
+                4,
+                2,
+            ],
+            "ref_weight": [
+                4 / 6,
+                2 / 6,
+            ],
+        },
+    )
+
+    group = working.filter(
+        pl.col("group") == "G1",
+    )
+
+    result = _compute_rate_stratum_stats(
+        group_data=group,
+        all_strata=reference_weights.select(
+            "age_band",
+        ),
+        event_col="count",
+        denominator_col=_DENOM_COL,
+        strata_cols=["age_band"],
+        reference_weights=reference_weights,
+    )
+
+    assert result["missing_strata_count"] == 1
+
+    assert result[
+        "missing_reference_weight"
+    ] == pytest.approx(
+        1 / 3,
+    )
+
+    assert result[
+        "observed_reference_weight"
+    ] == pytest.approx(
+        2 / 3,
+    )
+
+    assert np.sum(
+        result["normalised_weights"],
+    ) == pytest.approx(1)
+
+
+def test_dsr_output_schema() -> None:
+    """DSR output reports scaling and interval methodology."""
+    df = pl.DataFrame(
+        {
+            "count": [
+                0,
+                1,
+            ],
+            "age_band": [
+                "A",
+                "B",
+            ],
+        },
+    )
+
+    result = directly_standardized_rate_df(
+        df,
+        event_col="count",
+        strata_cols=["age_band"],
+    )
+
+    assert result.columns == [
+        "events",
+        "denominator",
+        "dsr",
+        "dsr_lower",
+        "dsr_upper",
+        "multiplier",
+        "confidence",
+        "method",
+        "notes",
+        "significance",
+    ]
+
+
+# ===========================================================================
+# Shared reporting helpers
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    (
+        "reference",
+        "lower",
+        "upper",
+        "expected",
+    ),
+    [
+        (
+            0.5,
+            0.6,
+            0.8,
+            "Higher",
+        ),
+        (
+            0.5,
+            0.1,
+            0.4,
+            "Lower",
+        ),
+        (
+            0.5,
+            0.4,
+            0.6,
+            "Not significant",
+        ),
+        (
+            np.nan,
+            0.4,
+            0.6,
+            "Not tested",
+        ),
+        (
+            0.5,
+            np.nan,
+            np.nan,
+            "Not tested",
+        ),
+    ],
+)
+def test_significance_classification(
+    reference: float,
+    lower: float,
+    upper: float,
+    expected: str,
+) -> None:
+    """Fixed-reference interval classification is deterministic."""
+    assert _significance_from_ci(
+        reference,
+        lower,
+        upper,
+    ) == expected
+
+
+def test_missing_strata_note_singular() -> None:
+    """One omitted stratum uses singular wording."""
+    note = _missing_strata_note(
+        missing_strata_count=1,
+        missing_reference_weight=0.25,
+        observed_reference_weight=0.75,
+    )
+
+    assert "1 stratum omitted" in note
+    assert "25.0%" in note
+    assert "75.0% coverage" in note
+
+
+def test_missing_strata_note_plural() -> None:
+    """Multiple omitted strata use plural wording."""
+    note = _missing_strata_note(
+        missing_strata_count=2,
+        missing_reference_weight=0.4,
+        observed_reference_weight=0.6,
+    )
+
+    assert "2 strata omitted" in note
+    assert "40.0%" in note
+    assert "60.0% coverage" in note
+
+
+# ===========================================================================
+# Integration tests
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    (
+        "function",
+        "event_col",
+        "extra_kwargs",
+    ),
+    [
+        (
+            crude_proportion_df,
+            "event",
+            {},
+        ),
+        (
+            crude_rate_df,
+            "count",
+            {},
+        ),
+        (
+            directly_standardized_proportion_df,
+            "event",
+            {
+                "strata_cols": [
+                    "age_band",
+                ],
+            },
+        ),
+        (
+            directly_standardized_rate_df,
+            "count",
+            {
+                "strata_cols": [
+                    "age_band",
+                ],
+            },
+        ),
+    ],
+)
+def test_all_functions_support_dimensions(
+    analytical_df: pl.DataFrame,
+    function: Callable[..., pl.DataFrame],
+    event_col: str,
+    extra_kwargs: dict[str, object],
+) -> None:
+    """All public functions support inequalities and organisations."""
+    result = function(
+        analytical_df,
+        event_col=event_col,
+        inequalities_cols=["sex"],
+        organisational_cols={
+            "geography": [
+                "region",
+                "icb",
+            ],
+        },
+        **extra_kwargs,
+    )
+
+    assert result.height > 1
+
+    assert {
+        "region",
+        "icb",
+        "sex",
+        "notes",
+        "significance",
+    } <= set(result.columns)
+
+    reference = get_row(
+        result,
+        region="All",
+        icb="All",
+        sex="All",
+    )
+
+    assert reference["significance"] == "Reference"
+
+
+@pytest.mark.parametrize(
+    (
+        "function",
+        "event_col",
+        "strata_cols",
+        "estimate_col",
+        "lower_col",
+        "upper_col",
+    ),
+    [
+        (
+            crude_proportion_df,
+            "event",
+            None,
+            "proportion",
+            "lower",
+            "upper",
+        ),
+        (
+            crude_rate_df,
+            "count",
+            None,
+            "rate",
+            "lower",
+            "upper",
+        ),
+        (
+            directly_standardized_proportion_df,
+            "event",
+            ["age_band"],
+            "dsp",
+            "dsp_lower",
+            "dsp_upper",
+        ),
+        (
+            directly_standardized_rate_df,
+            "count",
+            ["age_band"],
+            "dsr",
+            "dsr_lower",
+            "dsr_upper",
+        ),
+    ],
+)
+def test_estimates_lie_within_confidence_intervals(
+    analytical_df: pl.DataFrame,
+    function: Callable[..., pl.DataFrame],
+    event_col: str,
+    strata_cols: list[str] | None,
+    estimate_col: str,
+    lower_col: str,
+    upper_col: str,
+) -> None:
+    """Every finite point estimate lies within its confidence interval."""
+    kwargs: dict[str, object] = {
+        "event_col": event_col,
+        "inequalities_cols": ["sex"],
+    }
+
+    if strata_cols is not None:
+        kwargs["strata_cols"] = strata_cols
+
+    result = function(
+        analytical_df,
+        **kwargs,
+    )
+
+    finite = result.filter(
+        pl.col(estimate_col).is_finite()
+        & pl.col(lower_col).is_finite()
+        & pl.col(upper_col).is_finite(),
+    )
+
+    assert finite.height > 0
+
+    assert finite.select(
+        (
+            pl.col(lower_col)
+            <= pl.col(estimate_col)
+        ).all(),
+    ).item()
+
+    assert finite.select(
+        (
+            pl.col(estimate_col)
+            <= pl.col(upper_col)
+        ).all(),
+    ).item()
