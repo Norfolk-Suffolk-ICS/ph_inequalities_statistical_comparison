@@ -1,6 +1,6 @@
 """
 ph_inequalities_statistical_comparison.py
-===========================================
+=========================================
 Public health standardisation functions using UKHSA/OHID-recommended methods.
 
 Input validation
@@ -37,12 +37,64 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from itertools import combinations, product
+from itertools import combinations, pairwise, product
+from numbers import Real
 from typing import Literal
 
 import numpy as np
 import polars as pl
 from scipy import stats
+
+
+_INTEGER_DTYPES = (
+    pl.Int8,
+    pl.Int16,
+    pl.Int32,
+    pl.Int64,
+    pl.UInt8,
+    pl.UInt16,
+    pl.UInt32,
+    pl.UInt64,
+)
+
+_FLOAT_DTYPES = (
+    pl.Float32,
+    pl.Float64,
+)
+
+_NUMERIC_DTYPES = (
+    *_INTEGER_DTYPES,
+    *_FLOAT_DTYPES,
+)
+
+_DENOM_COL = "_denom_end_of_period_n"
+
+_RESERVED_ANALYSIS_COLUMNS = frozenset(
+    {
+        "events",
+        "n",
+        "denominator",
+        "proportion",
+        "rate",
+        "dsp",
+        "dsr",
+        "lower",
+        "upper",
+        "dsp_lower",
+        "dsp_upper",
+        "dsr_lower",
+        "dsr_upper",
+        "confidence",
+        "multiplier",
+        "method",
+        "notes",
+        "significance",
+        "ref_count",
+        "ref_weight",
+        "_parents",
+        _DENOM_COL,
+    }
+)
 
 
 # ===========================================================================
@@ -125,7 +177,7 @@ def _bin_numeric_to_quartiles(
             f"'{series.name}'."
         )
 
-    def label(value: int | float) -> str:
+    def label(value: float) -> str:
         if value <= q1:
             return "Q1"
         if value <= q2:
@@ -136,7 +188,10 @@ def _bin_numeric_to_quartiles(
 
     return pl.Series(
         name=series.name,
-        values=[label(value) for value in series.to_list()],
+        values=[
+            label(value)
+            for value in series.to_list()
+        ],
         dtype=pl.Utf8,
     )
 
@@ -165,28 +220,6 @@ def _build_reference_weights(
             ).alias("ref_weight"),
         )
     )
-
-
-_INTEGER_DTYPES = (
-    pl.Int8,
-    pl.Int16,
-    pl.Int32,
-    pl.Int64,
-    pl.UInt8,
-    pl.UInt16,
-    pl.UInt32,
-    pl.UInt64,
-)
-
-_FLOAT_DTYPES = (
-    pl.Float32,
-    pl.Float64,
-)
-
-_NUMERIC_DTYPES = (
-    *_INTEGER_DTYPES,
-    *_FLOAT_DTYPES,
-)
 
 
 def _bin_strata(
@@ -221,6 +254,27 @@ def _check_columns(
     if missing:
         raise ValueError(
             f"Columns not found in dataframe: {missing}"
+        )
+
+
+def _check_reserved_column_names(
+    strata_cols: Sequence[str],
+    dimension_cols: Sequence[str],
+) -> None:
+    """Reject analytical columns that collide with generated columns."""
+    conflicts = sorted(
+        (
+            set(strata_cols)
+            | set(dimension_cols)
+        )
+        & _RESERVED_ANALYSIS_COLUMNS
+    )
+
+    if conflicts:
+        raise ValueError(
+            "Strata, inequality, and organisational columns cannot use "
+            "reserved analysis column names. Conflicting column(s): "
+            f"{conflicts}."
         )
 
 
@@ -444,9 +498,6 @@ def _prepare_dataframe_rate(
     )
 
 
-_DENOM_COL = "_denom_end_of_period_n"
-
-
 def _add_end_of_period_denominator(
     df: pl.DataFrame,
 ) -> pl.DataFrame:
@@ -457,6 +508,13 @@ def _add_end_of_period_denominator(
     treats each row as one unit of exposure present at the end of the
     reporting period.
     """
+    if _DENOM_COL in df.columns:
+        raise ValueError(
+            "The input dataframe already contains the reserved internal "
+            f"column '{_DENOM_COL}'. Rename or remove it before calling "
+            "a rate function."
+        )
+
     return df.with_columns(
         pl.lit(1.0).alias(_DENOM_COL),
     )
@@ -576,6 +634,11 @@ def _prepare_dimensions(
             "df must be a Polars DataFrame."
         )
 
+    if df.height == 0:
+        raise ValueError(
+            "df must contain at least one row."
+        )
+
     if not isinstance(event_col, str) or not event_col:
         raise ValueError(
             "event_col must be a non-empty string."
@@ -682,6 +745,11 @@ def _prepare_dimensions(
         hierarchies,
     )
 
+    _check_reserved_column_names(
+        strata_cols=strata,
+        dimension_cols=dimensions,
+    )
+
     strata_dimension_overlap = sorted(
         set(strata) & set(dimensions),
     )
@@ -746,10 +814,7 @@ def _prepare_dimensions(
     )
 
     for name, levels in hierarchies.items():
-        for parent, child in zip(
-            levels,
-            levels[1:],
-        ):
+        for parent, child in pairwise(levels):
             invalid = (
                 df.select(
                     parent,
@@ -950,7 +1015,15 @@ def _validate_options(
     confidence: float,
     multiplier: float | None = None,
 ) -> None:
-    """Validate common statistical options."""
+    """Validate common statistical options with explicit type errors."""
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, Real)
+    ):
+        raise TypeError(
+            "confidence must be a real numeric value, not a boolean."
+        )
+
     if (
         not np.isfinite(confidence)
         or not 0 < confidence < 1
@@ -959,12 +1032,20 @@ def _validate_options(
             "confidence must be finite and strictly between 0 and 1."
         )
 
+    if multiplier is None:
+        return
+
     if (
-        multiplier is not None
-        and (
-            not np.isfinite(multiplier)
-            or multiplier <= 0
+        isinstance(multiplier, bool)
+        or not isinstance(multiplier, Real)
+    ):
+        raise TypeError(
+            "multiplier must be a real numeric value, not a boolean."
         )
+
+    if (
+        not np.isfinite(multiplier)
+        or multiplier <= 0
     ):
         raise ValueError(
             "multiplier must be finite and positive."
@@ -2216,29 +2297,19 @@ def directly_standardized_proportion_df(
         if is_reference:
             estimate = reference
 
-            if overall_n:
-                (
-                    lower,
-                    upper,
-                    _,
-                ) = _wilson_dobson_proportion_ci(
-                    dsp=reference,
-                    crude_events=overall_events,
-                    crude_n=overall_n,
-                    stratum_weights=np.array([1.0]),
-                    stratum_props=np.array([reference]),
-                    stratum_ns=np.array([overall_n]),
-                    confidence=confidence,
-                )
-
-            else:
-                (
-                    lower,
-                    upper,
-                ) = (
-                    np.nan,
-                    np.nan,
-                )
+            (
+                lower,
+                upper,
+                _,
+            ) = _wilson_dobson_proportion_ci(
+                dsp=reference,
+                crude_events=overall_events,
+                crude_n=overall_n,
+                stratum_weights=np.array([1.0]),
+                stratum_props=np.array([reference]),
+                stratum_ns=np.array([overall_n]),
+                confidence=confidence,
+            )
 
             notes.append(
                 "Overall proportion: no weighting applied because this "
@@ -2525,36 +2596,31 @@ def directly_standardized_rate_df(
         if is_reference:
             estimate_unscaled = reference_unscaled
 
-            if denominator:
-                if events < 10:
-                    (
-                        count_lower,
-                        count_upper,
-                    ) = _exact_poisson_count_ci(
-                        events,
-                        confidence,
-                    )
-
-                else:
-                    (
-                        count_lower,
-                        count_upper,
-                    ) = _byar_count_ci(
-                        events,
-                        confidence,
-                    )
-
-                lower_unscaled = (
-                    count_lower / denominator
-                )
-
-                upper_unscaled = (
-                    count_upper / denominator
+            if events < 10:
+                (
+                    count_lower,
+                    count_upper,
+                ) = _exact_poisson_count_ci(
+                    events,
+                    confidence,
                 )
 
             else:
-                lower_unscaled = np.nan
-                upper_unscaled = np.nan
+                (
+                    count_lower,
+                    count_upper,
+                ) = _byar_count_ci(
+                    events,
+                    confidence,
+                )
+
+            lower_unscaled = (
+                count_lower / denominator
+            )
+
+            upper_unscaled = (
+                count_upper / denominator
+            )
 
             notes.append(
                 "Overall rate: no weighting applied because this row "
@@ -2640,11 +2706,6 @@ def directly_standardized_rate_df(
             notes.append(
                 "Low event count (<10): DSR should generally not be "
                 "reported."
-            )
-
-        if denominator == 0:
-            notes.append(
-                "Zero denominator."
             )
 
         estimate = scale(
