@@ -2058,7 +2058,7 @@ def test_crude_rate_zero_events_has_positive_upper_limit() -> None:
     assert row["rate"] == 0
     assert row["lower"] == 0
     assert row["upper"] > 0
-    assert "Zero events" in row["notes"]
+    assert "Zero event count" in row["notes"]
 
 
 def test_crude_rate_records_denominator_assumption() -> None:

@@ -340,20 +340,20 @@ These values are descriptive labels, not p-value-based tests, and there is no mu
 
 ## Notes column
 
-`notes` is a pipe-separated string. Several fragments can occur in one row, in the order documented below. An empty string means that no note condition was triggered. Notes are advisory: the package does not suppress a result automatically.
+`notes` is a pipe-separated string. Several fragments can occur in one row, in the order documented below. An empty string means that no note condition was triggered. The package does not suppress results automatically; where a note says a result **must** be flagged or suppressed, the user must apply that action in downstream tables and visual outputs.
 
 ### Crude proportion notes
 
 | Exact note text | Trigger | Interpretation/action |
 |---|---|---|
 | `Zero denominator - suppress the result and reconsider the organisational hierarchy or inequality dimensions.` | `n == 0` | The estimate is undefined. Validated public calls generate only non-empty groups, so this is defensive logic rather than a normally reachable public output. |
-| `Zero events - confidence intervals may be unstable.` | `events == 0` and `n > 0` | The point estimate is zero; the Wilson upper limit remains positive. |
-| `Low event count (<10) - flag as unstable or suppress in visual outputs.` | `0 < events < 10` | Review stability and disclosure/publication policy. |
-| `All events (proportion = 1) - flag as a boundary estimate or suppress in visual outputs.` | `events == n` and `n > 0` | The point estimate is one; the Wilson lower limit remains below one. |
-| `Low non-event count (<10) - confidence intervals may be unstable.` | `0 < n - events < 10` | The upper-boundary complement is sparse. |
-| `Low sample size (<40) - flag the proportion as unstable.` | `0 < n < 40` | Small denominator warning, independent of the event-count notes. |
+| `No events (proportion = 0) - must either flag as a boundary estimate or suppress in visual outputs.` | `events == 0` and `n > 0` | The point estimate is zero. It must be visibly flagged as a boundary estimate or suppressed downstream. |
+| `Low event count (<10) - must flag as unstable or suppress in visual outputs.` | `0 < events < 10` | The result must be marked as unstable or suppressed downstream. |
+| `All events (proportion = 1) - flag as a boundary estimate or suppress in visual outputs.` | `events == n` and `n > 0` | The point estimate is one. It should be flagged as a boundary estimate or suppressed downstream. |
+| `Low non-event count (<10) - must flag as unstable or suppress in visual outputs.` | `0 < n - events < 10` | The non-event complement is sparse. The result must be marked as unstable or suppressed downstream. |
+| `Low sample size (<40) - flag the proportion as unstable.` | `0 < n < 40` | The proportion should be marked as unstable because its denominator is small. |
 
-`Zero events` and `Low event count` are mutually exclusive. `All events` and `Low non-event count` are also mutually exclusive. The sample-size note can accompany either event-side warning.
+`No events` and `Low event count` are mutually exclusive. `All events` and `Low non-event count` are also mutually exclusive. The sample-size note can accompany either an event-side or non-event-side warning.
 
 ### Crude rate notes
 
@@ -361,25 +361,25 @@ These values are descriptive labels, not p-value-based tests, and there is no mu
 |---|---|---|
 | `End-of-period denominator: row count used as exposure (assumes each row represents one patient present at the period end and does not account for partial-period exposure).` | Every crude-rate row | Confirms the denominator construction and its exposure limitation. |
 | `Zero denominator.` | `denominator == 0` | The rate is undefined. This is defensive logic and is not normally reachable from a validated non-empty public result group. |
-| `Zero events - confidence intervals may be unstable.` | `events == 0` and denominator is positive | The exact Poisson upper limit remains positive. |
-| `Low event count (<10) - flag as unstable or suppress in visual outputs.` | `0 < events < 10` | The exact interval is used; review stability and publication policy. |
-| `Low denominator (<40) - flag the rate as unstable.` | `0 < denominator < 40` | Small row-count exposure warning. |
+| `Zero event count - flag as unstable or suppress in visual outputs.` | `events == 0` and denominator is positive | The result should be marked as unstable or suppressed downstream. The exact Poisson upper limit remains positive. |
+| `Low event count (<10) - flag as unstable or suppress in visual outputs.` | `0 < events < 10` | The exact interval is used; flag the result as unstable or suppress it downstream. |
+| `Low denominator (<40) - flag the rate as unstable.` | `0 < denominator < 40` | The rate should be marked as unstable because its row-count exposure is small. |
 
-The end-of-period note is always first. `Zero events` and `Low event count` are mutually exclusive.
+The end-of-period note is always first. `Zero event count` and `Low event count` are mutually exclusive.
 
 ### DSP notes
 
 | Exact note text | Trigger | Interpretation/action |
 |---|---|---|
 | `Reference population: full standardisation weights used; the standardised estimate equals the overall observed proportion.` | Overall reference row | All empirical reference strata are present; the reference DSP equals the full-data crude proportion. |
-| `Calculated with missing standardisation stratum: 1 stratum omitted, representing {missing%} of the reference population; the remaining reference weights ({coverage%} coverage) were renormalised to sum to 1.` | One positively weighted reference stratum is absent from a non-reference group | The effective standard population excludes that stratum. Percentages are displayed to one decimal place. |
-| `Calculated with missing standardisation strata: {count} strata omitted, representing {missing%} of the reference population; the remaining reference weights ({coverage%} coverage) were renormalised to sum to 1.` | More than one positively weighted reference stratum is absent | Same as above, with plural wording. |
-| `Unreliable: stratum n < 10.` | At least one observed stratum has `0 < n_i < 10` | A stratum-level proportion is based on fewer than 10 rows. |
-| `Unreliable: stratum non-event count < 10.` | At least one observed stratum has `0 < n_i - events_i < 10` | At least one stratum has a sparse non-event complement. A stratum with zero non-events does not trigger this fragment. |
-| `Zero events.` | Total group events equal zero | The DSP point estimate is zero; the Wilson-MOVER upper limit can remain positive. |
-| `Low event count (<10).` | Total group events are from 1 to 9 | The DSP is returned but has a low total event count. |
-| `All events (proportion = 1).` | Every row in the group is an event | The DSP point estimate is one; its lower limit can remain below one. |
-| `Low non-event count (<10).` | Total group non-events are from 1 to 9 | The group has a sparse total non-event complement. |
+| `Calculated with missing standardisation stratum: 1 stratum omitted, representing {missing%} of the reference population; the remaining reference weights ({coverage%} coverage) were renormalised to sum to 1 Strongly consider coarsening strata, inequalities or dimensions` | One positively weighted reference stratum is absent from a result group | The effective standard population excludes that stratum. Percentages are displayed to one decimal place. Strongly consider reducing the granularity of the analysis. |
+| `Calculated with missing standardisation strata: {count} strata omitted, representing {missing%} of the reference population; the remaining reference weights ({coverage%} coverage) were renormalised to sum to 1 Strongly consider coarsening strata, inequalities or dimensions` | More than one positively weighted reference stratum is absent from a result group | Same as above, with plural wording and the number of omitted strata inserted. |
+| `Unreliable: at least one stratum has n < 10 flag as unstable or suppress in visual outputs and strongly consider coarsening strata, inequalities or dimensions` | At least one observed stratum has `0 < n_i < 10` | Flag or suppress the result and strongly consider reducing the granularity of the analysis. |
+| `Unreliable: stratum non-event count < 10 flag as unstable or suppress in visual outputs and strongly consider coarsening strata, inequalities or dimensions` | At least one observed stratum has `0 < n_i - events_i < 10` | Flag or suppress the result and strongly consider reducing the granularity of the analysis. A stratum with zero non-events does not trigger this fragment. |
+| `Zero total events flag as unstable or suppress in visual outputs` | Total group events equal zero | The DSP point estimate is zero. Flag the result as unstable or suppress it downstream. |
+| `low total event count (<10) flag as unstable or suppress in visual outputs` | Total group events are from 1 to 9 | Flag the result as unstable or suppress it downstream. The initial `low` is lowercase in the generated text. |
+| `All events (proportion = 1) flag as unstable or suppress in visual outputs` | Every row in the group is an event | The DSP point estimate is one. Flag the result as unstable or suppress it downstream. |
+| `Low non-event count (<10) flag as unstable or suppress in visual outputs` | Total group non-events are from 1 to 9 | Flag the result as unstable or suppress it downstream. |
 
 The reference note is first when present, followed by missing-strata, stratum-level, and total-count notes. No Haldane-Anscombe correction is used or reported. A well-populated, complete non-reference group can have an empty `notes` value.
 
@@ -389,11 +389,11 @@ The reference note is first when present, followed by missing-strata, stratum-le
 |---|---|---|
 | `End-of-period denominator: row count used as exposure (assumes each row represents one patient present at the period end and does not account for partial-period exposure).` | Every DSR row | Confirms that each row contributes one unit of exposure. |
 | `Reference population: full standardisation weights used.` | Overall reference row | All empirical reference weights are used. |
-| `Calculated with missing standardisation stratum: 1 stratum omitted, representing {missing%} of the reference population; the remaining reference weights ({coverage%} coverage) were renormalised to sum to 1.` | One positively weighted reference stratum is absent from a non-reference group | The effective standard population excludes that stratum. Percentages are displayed to one decimal place. |
-| `Calculated with missing standardisation strata: {count} strata omitted, representing {missing%} of the reference population; the remaining reference weights ({coverage%} coverage) were renormalised to sum to 1.` | More than one positively weighted reference stratum is absent | Same as above, with plural wording. |
-| `Unreliable: stratum denominator < 10.` | At least one observed stratum has `0 < denominator_i < 10` | At least one stratum rate uses fewer than 10 rows of exposure. |
-| `Zero total events: the DSR point estimate may be zero, but the Poisson-MOVER upper confidence limit remains positive.` | Total group events equal zero | Explains the non-zero upper limit at a zero point estimate. |
-| `Low total event count (<10): DSR calculated but should be treated as unstable and may be unsuitable for publication.` | Total group events are below 10, including zero | The DSR is returned rather than suppressed. |
+| `Calculated with missing standardisation stratum: 1 stratum omitted, representing {missing%} of the reference population; the remaining reference weights ({coverage%} coverage) were renormalised to sum to 1 Strongly consider coarsening strata, inequalities or dimensions` | One positively weighted reference stratum is absent from a result group | The effective standard population excludes that stratum. Percentages are displayed to one decimal place. Strongly consider reducing the granularity of the analysis. |
+| `Calculated with missing standardisation strata: {count} strata omitted, representing {missing%} of the reference population; the remaining reference weights ({coverage%} coverage) were renormalised to sum to 1 Strongly consider coarsening strata, inequalities or dimensions` | More than one positively weighted reference stratum is absent from a result group | Same as above, with plural wording and the number of omitted strata inserted. |
+| `Unreliable: stratum denominator < 10 flag as unstable or suppress in visual outputs and strongly consider coarsening strata, inequalities or dimensions` | At least one observed stratum has `0 < denominator_i < 10` | Flag or suppress the result and strongly consider reducing the granularity of the analysis. |
+| `Zero total events flag as unstable or suppress in visual outputs` | Total group events equal zero | The DSR point estimate and lower limit are zero, while the Poisson-MOVER upper limit remains positive. Flag or suppress the result downstream. |
+| `Low total event count (<10) flag as unstable or suppress in visual outputs` | Total group events are below 10, including zero | Flag the calculated DSR as unstable or suppress it downstream. |
 
 The end-of-period note is always first. A zero-event DSR receives both the `Zero total events` and `Low total event count (<10)` fragments. There is no separate DSR note for a low event count within an individual stratum; exact versus Byar stratum treatment is recorded in `method`.
 
@@ -404,10 +404,11 @@ Suppose the full input has reference weights 66.7% for stratum A and 33.3% for s
 ```text
 Calculated with missing standardisation stratum: 1 stratum omitted,
 representing 33.3% of the reference population; the remaining reference
-weights (66.7% coverage) were renormalised to sum to 1.
+weights (66.7% coverage) were renormalised to sum to 1 Strongly consider
+coarsening strata, inequalities or dimensions
 ```
 
-This result should not be interpreted as though G1 had a zero outcome in B. It is an estimate for the retained standard-population coverage and may not be directly comparable when different groups omit different or substantial reference shares.
+This result should not be interpreted as though G1 had a zero outcome in B. It is an estimate for the retained standard-population coverage and may not be directly comparable when different groups omit different or substantial reference shares. The revised note explicitly recommends coarsening the strata, inequality categories, or dimensions.
 
 ## Publication checks
 
