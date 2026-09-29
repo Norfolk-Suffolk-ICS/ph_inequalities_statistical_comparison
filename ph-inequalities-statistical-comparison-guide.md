@@ -1,205 +1,421 @@
-## Overview
+# User guide
 
-This module provides four functions for summarising binary/count outcomes across groups (e.g. core20, plus, alliances, PCNs, etc), each returning a per-group estimate alongside a confidence interval and a flag showing whether that group differs from the population as a whole.
+## Public API
 
-| Function | Measure | Use when |
+The package exposes four functions from `ph_inequalities_statistical_comparison`:
+
+| Function | Use when | Event column | Result |
+|---|---|---|---|
+| `crude_proportion_df()` | The outcome is binary and no adjustment is required | Boolean or integer 0/1 | Crude proportion with Wilson limits |
+| `crude_rate_df()` | Rows represent end-of-period exposure and may contain multiple events | Non-negative integer count | Crude rate with exact/Byar Poisson limits |
+| `directly_standardized_proportion_df()` | A binary outcome should be adjusted for influential characteristics (e.g age) | Boolean or integer 0/1 | DSP with Wilson-MOVER limits |
+| `directly_standardized_rate_df()` | A count-based rate should be adjusted for influential characteristics (e.g age) | Non-negative integer count | DSR with Poisson-MOVER limits |
+
+
+## Installation and import
+
+Python 3.12 or later is required.
+
+```bash
+pip install git+https://github.com/Norfolk-Suffolk-ICS/ph_inequalities_statistical_comparison.git
+```
+
+```python
+from ph_inequalities_statistical_comparison import (
+    crude_proportion_df,
+    crude_rate_df,
+    directly_standardized_proportion_df,
+    directly_standardized_rate_df,
+)
+```
+
+## Input requirements
+
+### Dataframe
+
+- `df` must be a non-empty `polars.DataFrame`; pandas dataframes are not accepted.
+- Required columns must exist.
+- Nulls, `NaN`, and infinite values are not permitted in the event, stratum, inequality, or organisational columns used in an analysis.
+- Output dimension columns are cast to strings so inactive dimensions can contain `all_label`.
+
+### Event column
+
+- All functions require `event_col` to be a non-empty column name.
+- Boolean event columns are accepted and converted to integers.
+- Proportion functions require an integer column containing only 0 and 1.
+- Rate functions require a non-negative integer column; values greater than 1 are allowed.
+- Floating-point event columns are rejected even when all values are mathematically whole numbers; cast them to an integer type first.
+
+### Standardisation strata
+
+- `strata_cols` is required by the DSP and DSR functions.
+- Supply a non-empty sequence such as `["age_band", "sex"]`, not a single string such as `"age_band"`.
+- A stratum column cannot also be the event column, an inequality dimension, or an organisational dimension.
+- Numeric strata are automatically converted to quartile labels `Q1`-`Q4` using cut points calculated from the full input dataframe.
+- With multiple strata, weights are based on the observed joint combinations.
+
+### Dimension columns
+
+- `inequalities_cols` must be `None` or a sequence of unique column names.
+- `organisational_cols` must be `None` or a mapping from a hierarchy name to an ordered sequence of unique columns, from highest to lowest level.
+- A column cannot appear in more than one organisational hierarchy or in both `inequalities_cols` and `organisational_cols`.
+- Within each organisational hierarchy, every child value must map to exactly one value of its immediate parent.
+- The event, strata, inequality, and organisational roles cannot overlap.
+- Values in dimension columns must not equal `all_label`; choose another label or recode the source value if a collision exists.
+
+The following names are reserved for generated or internal analysis columns and cannot be used for strata, inequalities, or organisational dimensions:
+
+```text
+events, n, denominator, proportion, rate, dsp, dsr,
+lower, upper, dsp_lower, dsp_upper, dsr_lower, dsr_upper,
+confidence, multiplier, method, notes, significance,
+ref_count, ref_weight, _parents, _denom_end_of_period_n
+```
+
+Rate inputs must also not already contain the internal column `_denom_end_of_period_n`.
+
+## Function signatures
+
+```python
+crude_proportion_df(
+    df,
+    event_col,
+    inequalities_cols=None,
+    organisational_cols=None,
+    *,
+    organisational_mode="separate",
+    all_label="All",
+    confidence=0.95,
+)
+```
+
+```python
+crude_rate_df(
+    df,
+    event_col,
+    inequalities_cols=None,
+    organisational_cols=None,
+    *,
+    organisational_mode="separate",
+    all_label="All",
+    multiplier=100_000.0,
+    confidence=0.95,
+)
+```
+
+```python
+directly_standardized_proportion_df(
+    df,
+    event_col,
+    strata_cols,
+    inequalities_cols=None,
+    organisational_cols=None,
+    *,
+    organisational_mode="separate",
+    all_label="All",
+    confidence=0.95,
+)
+```
+
+```python
+directly_standardized_rate_df(
+    df,
+    event_col,
+    strata_cols,
+    inequalities_cols=None,
+    organisational_cols=None,
+    *,
+    organisational_mode="separate",
+    all_label="All",
+    multiplier=100_000.0,
+    confidence=0.95,
+)
+```
+
+## Arguments
+
+| Argument | Functions | Requirement and effect |
 |---|---|---|
-| `crude_proportion_df` | Crude proportion | You want a raw % without adjusting for population structure |
-| `crude_rate_df` | Crude rate | You have row-per-unit-of-exposure data and want a raw rate |
-| `directly_standardized_proportion_df` | DSP | You need to compare proportions across groups with different age/sex/etc. mixes |
-| `directly_standardized_rate_df` | DSR | You need to compare rates across groups with different age/sex/etc. mixes |
+| `df` | All | Non-empty Polars dataframe containing row-level analytical data. |
+| `event_col` | All | Name of the event column. Binary for proportions; non-negative integer count for rates. |
+| `strata_cols` | DSP, DSR | Non-empty sequence defining the joint standardisation strata. Numeric columns are binned into quartiles. |
+| `inequalities_cols` | All | Optional sequence of inequality dimensions. The function returns the complete marginal cube over these columns. |
+| `organisational_cols` | All | Optional named mapping of top-to-bottom organisational hierarchies, for example `{"commissioning": ["region", "icb", "practice"]}`. |
+| `organisational_mode` | All | `"separate"` (default) rolls multiple hierarchies up independently; `"cross"` generates valid cross-hierarchy combinations. |
+| `all_label` | All | Non-empty string used for inactive dimensions and the overall reference row; default `"All"`. It must not already occur in a dimension column. |
+| `multiplier` | Rate, DSR | Finite positive number used to scale rates; default 100,000. |
+| `confidence` | All | Finite real number strictly between 0 and 1; default 0.95. Booleans are rejected. |
 
-All four functions share a common design: they compute a value for every group **and** append a single **"Overall" row** representing the full input dataset, then compare every group's confidence interval against that Overall value to flag whether the group sits meaningfully higher or lower.
+Arguments after `*` are keyword-only.
 
-------------------------------------------------------------------------
+## Grouping behaviour
 
-## 1. Data Requirements
+### Inequality cube
 
-### Row-level data expected
+Every subset of `inequalities_cols` is generated. For `inequalities_cols=["sex", "deprivation"]`, this includes:
 
-Every function expects **row-level tabular data** in a Polars DataFrame — not pre-summarised percentages or rates.
+- `sex × deprivation` combinations;
+- sex margins with deprivation set to `all_label`;
+- deprivation margins with sex set to `all_label`;
+- the overall row with both set to `all_label`.
 
-- `crude_proportion_df` and `directly_standardized_proportion_df` need a binary `event_col` (0/1 or boolean). Each row is one record; the proportion is `sum(event_col) / row_count`.
-- `crude_rate_df` and `directly_standardized_rate_df` need an `event_col` containing event counts (any non-negative integer, not restricted to 0/1 — e.g. multiple emergency attendances for one patient in a single row is valid). Neither function accepts a denominator, exposure, or person-time argument: the denominator is always derived internally from row count within each group/stratum, treating each row as one unit of exposure present at the end of the reporting period. This is a simplifying assumption for patient-level data where true person-time is unavailable, and it is flagged on every output row (see Section 3).
+### Organisational hierarchies
 
-### Strata columns (DSP/DSR only)
+For a hierarchy declared as:
 
-`strata_cols` define the standardisation strata (e.g. age band, sex). **Numeric strata columns are automatically binned into quartiles (Q1–Q4)** using the full dataset's distribution — you do not need to pre-bin age into bands yourself. Categorical strata columns (e.g. sex, ethnicity) are used as-is.
+```python
+{
+    "commissioning": ["region", "icb", "practice"]
+}
+```
 
-### Group columns
+only valid top-down prefixes are generated:
 
-`group_cols` define what you're comparing (e.g. core20, alliance). One output row is produced per unique combination of `group_cols`, plus the Overall row. For `crude_proportion_df` and `crude_rate_df`, `group_cols` is optional — if omitted, the function returns a single row summarising the whole dataset with no group comparison. For the two standardised functions, `group_cols` is required.
+- region × ICB × practice;
+- region × ICB;
+- region;
+- overall.
 
-### Nulls and types (strictly enforced)
+Lower levels are never grouped without their parents. Each organisational state is combined with the complete inequality cube.
 
-All four functions validate their inputs before doing any computation, and raise informative errors rather than silently dropping or coercing bad data:
+With multiple hierarchies, `organisational_mode="separate"` generates each hierarchy's prefixes independently plus overall. `organisational_mode="cross"` takes the Cartesian product of valid prefixes, including states in which one hierarchy is active and another is overall. Duplicate grouping sets are removed.
 
-- **Missing columns** raise a clear `ValueError` naming the missing fields.
-- **Nulls/NAs are rejected outright** in the numerator (`event_col`), all `strata_cols`, and all `group_cols`. The error message names every offending column and its null count in one go, e.g. `"Null/NA values are not permitted... Offending column(s): 'age' (3 null values), 'region' (1 null value)."` You must remove or impute these rows before calling the function.
-- **The numerator column must be a non-negative integer column** (or boolean, cast to `Int64` automatically). Passing a float column (e.g. `1.0`, `0.0`) or a string column raises a `ValueError` naming the offending dtype. Negative integers also raise an error.
-- **For the two proportion functions** (`crude_proportion_df`, `directly_standardized_proportion_df`), the numerator must contain *only* 0 or 1 values — any other integer (e.g. a stray `2`) raises an error.
-- **For the two rate functions**, the numerator may be any non-negative integer.
-- Zero-denominator or zero-event groups (once past validation) are handled gracefully and flagged in `notes` rather than raising errors — validation only rejects structurally invalid data, not sparse-but-valid data.
+## Worked input
 
-------------------------------------------------------------------------
+The examples below use the same dataframe so the four outputs can be compared directly.
 
-## 2. The "Overall" Row
+```python
+import polars as pl
 
-Every function appends a row where all `group_cols` are set to the string `"Overall"`. This row summarises the **entire input dataset** as a single group, computed the same way as any other row — with one exception for DSP and DSR (see below).
+example = pl.DataFrame(
+    {
+        "event": [
+            1, 0, 0, 0, 1, 1, 0, 0,
+            1, 1, 1, 0, 1, 1, 0, 0,
+        ],
+        "count": [
+            1, 1, 1, 1, 3, 3, 3, 3,
+            0, 0, 0, 0, 2, 2, 2, 2,
+        ],
+        "age_band": ["A"] * 4 + ["B"] * 4 + ["A"] * 4 + ["B"] * 4,
+        "group": ["G1"] * 8 + ["G2"] * 8,
+    }
+)
+```
 
-The Overall row serves two purposes: it acts as a population benchmark, letting you see the national/organisational average alongside each group's estimate without a separate calculation; and it is the fixed reference point that every other row's `significance` label is assessed against (see Section 4).
+The displayed tables omit `confidence` and `notes` only to keep the worked output compact. The returned dataframes contain every column listed in the output schemas below.
 
-### DSP and DSR: the Overall row is crude, not standardised
+## `crude_proportion_df()`
 
-For `directly_standardized_proportion_df` and `directly_standardized_rate_df`, the Overall row reports the **crude (unstandardised)** proportion or rate — not a re-run of the standardisation weighting logic. This is because the Overall row's population **is** the reference population used to build the standardisation weights in the first place; standardising the whole population against itself would just return the crude value again, so the function skips that redundant step and states this explicitly in `notes`:
+```python
+crude_proportions = crude_proportion_df(
+    example,
+    event_col="event",
+    inequalities_cols=["group"],
+)
+```
 
-> `"Overall proportion: no weighting applied as this row is itself the reference population"` (DSP)
->
-> `"Overall rate: no weighting applied as this row is itself the reference population"` (DSR)
+| group | events | n | proportion | lower | upper | method | significance |
+|---|---:|---:|---:|---:|---:|---|---|
+| G1 | 3 | 8 | 0.375000 | 0.136844 | 0.694258 | Wilson score | Not significant |
+| G2 | 5 | 8 | 0.625000 | 0.305742 | 0.863156 | Wilson score | Not significant |
+| All | 8 | 16 | 0.500000 | 0.279996 | 0.720004 | Wilson score | Reference |
 
-------------------------------------------------------------------------
+Output columns, after any dimension columns:
 
-## 3. Function-by-Function Reference
+```text
+events, n, proportion, lower, upper,
+confidence, method, notes, significance
+```
 
-### `crude_proportion_df`
+- `events`: sum of the binary event column.
+- `n`: row count.
+- `proportion`: `events / n`.
+- `lower`, `upper`: Wilson score confidence limits.
+- `method`: always `Wilson score`.
 
-**Signature:** `crude_proportion_df(df, event_col, group_cols=None, confidence=0.95)`
+## `crude_rate_df()`
 
-**Output columns:** `[*group_cols, events, n, proportion, lower, upper, confidence, method, notes, significance]`
+```python
+crude_rates = crude_rate_df(
+    example,
+    event_col="count",
+    inequalities_cols=["group"],
+    multiplier=1_000,
+)
+```
 
-| Column | Description |
+| group | events | denominator | rate | lower | upper | method | significance |
+|---|---:|---:|---:|---:|---:|---|---|
+| G1 | 16 | 8 | 2000.000000 | 1142.438615 | 3248.054774 | Byar | Not significant |
+| G2 | 8 | 8 | 1000.000000 | 431.729022 | 1970.398653 | Exact chi-square | Not significant |
+| All | 24 | 16 | 1500.000000 | 960.795056 | 2231.976027 | Byar | Reference |
+
+Output columns, after any dimension columns:
+
+```text
+events, denominator, rate, lower, upper,
+multiplier, confidence, method, notes, significance
+```
+
+- `events`: sum of the non-negative integer count column.
+- `denominator`: row count, not an externally supplied person-time denominator.
+- `rate`: `events / denominator * multiplier`.
+- `lower`, `upper`: scaled Poisson confidence limits.
+- `method`: `Exact chi-square` when total events are below 10; otherwise `Byar`.
+
+## `directly_standardized_proportion_df()`
+
+```python
+dsp = directly_standardized_proportion_df(
+    example,
+    event_col="event",
+    strata_cols=["age_band"],
+    inequalities_cols=["group"],
+)
+```
+
+| group | events | n | dsp | dsp_lower | dsp_upper | method | significance |
+|---|---:|---:|---:|---:|---:|---|---|
+| G1 | 3 | 8 | 0.375000 | 0.172357 | 0.659779 | Wilson-MOVER | Not significant |
+| G2 | 5 | 8 | 0.625000 | 0.340221 | 0.827643 | Wilson-MOVER | Not significant |
+| All | 8 | 16 | 0.500000 | 0.298627 | 0.701373 | Wilson-MOVER | Reference |
+
+Output columns, after any dimension columns:
+
+```text
+events, n, dsp, dsp_lower, dsp_upper,
+confidence, method, notes, significance
+```
+
+- `events`, `n`: unstandardised totals for the displayed group.
+- `dsp`: reference-weighted sum of uncorrected stratum proportions.
+- `dsp_lower`, `dsp_upper`: Wilson-MOVER limits.
+- `method`: always `Wilson-MOVER`.
+- DSP estimates and limits are rounded to six decimal places.
+
+## `directly_standardized_rate_df()`
+
+```python
+dsr = directly_standardized_rate_df(
+    example,
+    event_col="count",
+    strata_cols=["age_band"],
+    inequalities_cols=["group"],
+    multiplier=1_000,
+)
+```
+
+| group | events | denominator | dsr | dsr_lower | dsr_upper | method | significance |
+|---|---:|---:|---:|---:|---:|---|---|
+| G1 | 16 | 8 | 2000.000000 | 1188.132828 | 3365.250971 | Poisson-MOVER using exact and Byar stratum intervals | Not significant |
+| G2 | 8 | 8 | 1000.000000 | 431.729022 | 2074.381643 | Poisson-MOVER using exact stratum intervals | Not significant |
+| All | 24 | 16 | 1500.000000 | 980.344449 | 2284.485609 | Poisson-MOVER using exact and Byar stratum intervals | Reference |
+
+Output columns, after any dimension columns:
+
+```text
+events, denominator, dsr, dsr_lower, dsr_upper,
+multiplier, confidence, method, notes, significance
+```
+
+- `events`: summed count for the displayed group.
+- `denominator`: row count.
+- `dsr`: reference-weighted sum of uncorrected stratum rates, scaled by `multiplier`.
+- `dsr_lower`, `dsr_upper`: scaled Poisson-MOVER limits.
+- `method`: states whether exact, Byar, or both types of stratum interval were used.
+- DSR estimates and limits are rounded to six decimal places.
+
+## Significance values
+
+| Value | Meaning |
 |---|---|
-| `*group_cols` | Every column passed in `group_cols`, repeated as-is; one row per unique combination, plus a final `"Overall"` row |
-| `events` | `sum(event_col)` within the group |
-| `n` | Row count within the group |
-| `proportion` | `events / n`; `NaN` when `n == 0` |
-| `lower`, `upper` | Wilson score confidence interval bounds |
-| `confidence` | The confidence level parameter (default 0.95) |
-| `method` | Always `"Wilson score"` — the only CI method this function uses |
-| `notes` | Pipe-separated quality flags; empty string when none apply |
-| `significance` | `"Higher"`, `"Lower"`, `"Not significant"`, `"Not tested"`, or `"Reference"` (Overall row only) — see Section 4 |
+| `Reference` | The overall row: all generated dimensions equal `all_label`. |
+| `Higher` | The fixed overall estimate is below the result's lower confidence limit. |
+| `Lower` | The fixed overall estimate is above the result's upper confidence limit. |
+| `Not significant` | The fixed overall estimate is inside the result's confidence interval, including its limits. |
+| `Not tested` | The benchmark or confidence interval is non-finite. |
 
-Example output for three alliances against an Overall proportion of 19.5%:
+These values are descriptive labels, not p-value-based tests, and there is no multiple-comparison correction.
 
-| alliance | events | n | proportion | lower | upper | significance |
-|---|---|---|---|---|---|---|
-| A | 90 | 300 | 0.300 | 0.257 | 0.347 | Higher |
-| B | 30 | 300 | 0.100 | 0.071 | 0.140 | Lower |
-| C | 0 | 15 | 0.000 | 0.000 | 0.206 | Not significant |
-| Overall | 120 | 615 | 0.195 | 0.163 | 0.231 | Reference |
+## Notes column
 
-### `crude_rate_df`
+`notes` is a pipe-separated string. Several fragments can occur in one row, in the order documented below. An empty string means that no note condition was triggered. Notes are advisory: the package does not suppress a result automatically.
 
-**Signature:** `crude_rate_df(df, event_col, group_cols=None, multiplier=100_000.0, confidence=0.95)`
+### Crude proportion notes
 
-**Output columns:** `[*group_cols, events, denominator, rate, lower, upper, multiplier, confidence, method, notes, significance]`
-
-| Column | Description |
-|---|---|
-| `*group_cols` | As above |
-| `events` | `sum(event_col)` within the group |
-| `denominator` | Row count within the group — this is always how the denominator is derived; there is no way to supply an external person-time column |
-| `rate` | `(events / denominator) * multiplier`; `NaN` if `denominator == 0` |
-| `lower`, `upper` | Confidence interval bounds, scaled by `multiplier` |
-| `multiplier` | The rate scaling factor passed to the function (default 100,000) |
-| `confidence` | The confidence level parameter |
-| `method` | `"Byar"` when `events >= 10`, `"Exact chi-square"` when `events < 10`, or `"undefined"` if the denominator is zero |
-| `notes` | Always includes the end-of-period denominator caveat, plus any sparsity flags |
-| `significance` | As above |
-
-### `directly_standardized_proportion_df`
-
-**Signature:** `directly_standardized_proportion_df(df, event_col, strata_cols, group_cols, confidence=0.95)`
-
-**Output columns:** `[*group_cols, events, n, dsp, dsp_lower, dsp_upper, notes, significance]`
-
-| Column | Description |
-|---|---|
-| `*group_cols` | As above |
-| `events` | Crude (unweighted) event count for the group |
-| `n` | Crude (unweighted) row count for the group |
-| `dsp` | The directly standardised proportion, weighted by the full dataset's stratum composition |
-| `dsp_lower`, `dsp_upper` | Wilson-Dobson confidence interval bounds around `dsp` |
-| `notes` | Quality flags — see Section 5 |
-| `significance` | As above; for the Overall row, this compares against itself and is always `"Reference"` |
-
-### `directly_standardized_rate_df`
-
-**Signature:** `directly_standardized_rate_df(df, event_col, strata_cols, group_cols, multiplier=100_000.0, confidence=0.95)`
-
-**Output columns:** `[*group_cols, events, denominator, dsr, dsr_lower, dsr_upper, multiplier, notes, significance]`
-
-| Column | Description |
-|---|---|
-| `*group_cols` | As above |
-| `events` | Crude (unweighted) event count for the group |
-| `denominator` | Crude (unweighted) row count for the group |
-| `dsr` | The directly standardised rate, scaled by `multiplier` |
-| `dsr_lower`, `dsr_upper` | Dobson-Byar confidence interval bounds around `dsr`, scaled by `multiplier` |
-| `multiplier` | The rate scaling factor passed to the function |
-| `notes` | Quality flags — see Section 5 |
-| `significance` | As above |
-
-------------------------------------------------------------------------
-
-## 4. How to Interpret the `significance` Column
-
-None of the four functions run a formal statistical hypothesis test (no p-values are calculated or reported). Instead, every non-Overall row's `significance` label is derived purely by checking whether the Overall value — treated as a **fixed benchmark**, not as a quantity with its own sampling uncertainty — falls inside or outside that row's own confidence interval:
-
-| Label | Meaning |
-|---|---|
-| `"Higher"` | The Overall/reference value falls below this group's `lower` bound — the group's estimate sits above what would be expected if it matched the population |
-| `"Lower"` | The Overall/reference value falls above this group's `upper` bound — the group's estimate sits below the population figure |
-| `"Not significant"` | The Overall/reference value falls within this group's confidence interval — the group is not distinguishable from the population at the stated confidence level |
-| `"Not tested"` | No comparison was possible (e.g. the group's confidence interval could not be computed, typically because the denominator or count was zero, or no `group_cols` were supplied) |
-| `"Reference"` | Reserved for the Overall row itself, which is never compared against itself |
-
-Because this is a confidence-interval-overlap check rather than a two-sample hypothesis test, it is intentionally simple and conservative: it does not correct for multiple comparisons across many groups, and it does not account for the fact that each group's data is itself a subset of the Overall figure it is being compared against. Wider confidence intervals (typically arising from smaller group sizes) make a `"Not significant"` result more likely purely because the interval is wide enough to contain the reference value, not necessarily because the underlying rates are truly similar — this should be borne in mind when interpreting results for small groups.
-
-------------------------------------------------------------------------
-
-## 5. How to Interpret the `notes` Column
-
-The `notes` column is a single string containing zero or more flags, separated by `" | "` when more than one applies. An empty string means no flags were triggered for that row. The full vocabulary of flags, and what each one means, is as follows.
-
-### Flags common to the crude functions
-
-| Flag | Appears when | What it means |
+| Exact note text | Trigger | Interpretation/action |
 |---|---|---|
-| `Zero denominator` | The group's row count (or denominator) is zero | No proportion/rate could be calculated; `proportion`/`rate` will be `NaN` |
-| `Zero events` | The group has no events at all | The proportion/rate is exactly 0; the confidence interval is still calculable and informative |
-| `Low event count (<10)` | Fewer than 10 events in the group | The confidence interval relies on a small-sample method (Wilson score, or exact chi-square rather than Byar) and should be interpreted cautiously |
-| `All events (proportion = 1)` | Every row in the group is an event (proportion functions only) | The proportion is exactly 1; interpret alongside the group's sample size |
-| `Low non-event count (<10)` | Fewer than 10 non-events in the group (proportion functions only) | The opposite boundary case to a low event count — the CI is still valid but reflects a small effective sample on one side |
-| `End-of-period denominator: row count used as exposure (...)` | Always present on every row for the two rate functions | A reminder that the denominator was derived by counting rows (treating each row as one patient present at the end of the reporting period) rather than from true person-time data; this does not account for patients who only had partial exposure during the period |
-| `consider suppression` (appended to the low event count flag in `crude_rate_df`) | Fewer than 10 events | A standard public-health-reporting convention: rates based on very small counts are often suppressed in published outputs to avoid potentially identifying individuals or misleading small-number rates |
+| `Zero denominator - suppress the result and reconsider the organisational hierarchy or inequality dimensions.` | `n == 0` | The estimate is undefined. Validated public calls generate only non-empty groups, so this is defensive logic rather than a normally reachable public output. |
+| `Zero events - confidence intervals may be unstable.` | `events == 0` and `n > 0` | The point estimate is zero; the Wilson upper limit remains positive. |
+| `Low event count (<10) - flag as unstable or suppress in visual outputs.` | `0 < events < 10` | Review stability and disclosure/publication policy. |
+| `All events (proportion = 1) - flag as a boundary estimate or suppress in visual outputs.` | `events == n` and `n > 0` | The point estimate is one; the Wilson lower limit remains below one. |
+| `Low non-event count (<10) - confidence intervals may be unstable.` | `0 < n - events < 10` | The upper-boundary complement is sparse. |
+| `Low sample size (<40) - flag the proportion as unstable.` | `0 < n < 40` | Small denominator warning, independent of the event-count notes. |
 
-### Flags specific to the standardised functions (DSP/DSR)
+`Zero events` and `Low event count` are mutually exclusive. `All events` and `Low non-event count` are also mutually exclusive. The sample-size note can accompany either event-side warning.
 
-| Flag | Appears when | What it means |
+### Crude rate notes
+
+| Exact note text | Trigger | Interpretation/action |
 |---|---|---|
-| `Haldane correction applied` | Any stratum within the group had zero events (DSR), or zero events/all events (DSP) | A small continuity correction (adding 0.5 to the stratum's event count and 1 to its denominator) was applied to that stratum before it was combined into the standardised estimate, preventing that stratum from contributing a degenerate (zero) variance to the overall calculation |
-| `Unreliable: stratum n<10` (DSP) / `Unreliable: stratum denominator <10` (DSR) | Any non-empty stratum within the group has fewer than 10 records | At least one of the strata feeding into the standardised estimate is thin enough that its contribution to the standardised value may be unstable, even if the group's total sample size looks reasonable |
-| `Unreliable: stratum non-event count <10` (DSP only) | Any non-empty stratum has fewer than 10 non-events | The mirror-image boundary case to the above, specific to proportions |
-| `Low event count (<10)` (DSP) / `Low event count (<10): DSR should generally not be reported` (DSR) | The group's crude (unweighted) event count is below 10 | The standardised estimate is being built from a small overall event count; for DSR specifically, this is flagged as a case where the standardised rate is not generally considered reliable enough for routine reporting |
-| `Zero events` | The group's crude event count is zero | The standardised value will be low or zero depending on stratum weighting |
-| `All events (proportion = 1)` (DSP only) | Every record in the group is an event | As with the crude proportion function, this is the upper boundary case |
-| `Zero denominator` (DSR only) | The group's crude row count is zero | No standardised rate could be calculated for this group |
-| `Overall proportion: no weighting applied as this row is itself the reference population` (DSP) / `Overall rate: no weighting applied as this row is itself the reference population` (DSR) | Always present on the Overall row only | Explains why the Overall row shows the crude, not standardised, value — see Section 2 |
+| `End-of-period denominator: row count used as exposure (assumes each row represents one patient present at the period end and does not account for partial-period exposure).` | Every crude-rate row | Confirms the denominator construction and its exposure limitation. |
+| `Zero denominator.` | `denominator == 0` | The rate is undefined. This is defensive logic and is not normally reachable from a validated non-empty public result group. |
+| `Zero events - confidence intervals may be unstable.` | `events == 0` and denominator is positive | The exact Poisson upper limit remains positive. |
+| `Low event count (<10) - flag as unstable or suppress in visual outputs.` | `0 < events < 10` | The exact interval is used; review stability and publication policy. |
+| `Low denominator (<40) - flag the rate as unstable.` | `0 < denominator < 40` | Small row-count exposure warning. |
 
-As with the crude functions, the end-of-period denominator caveat also appears on every row of `directly_standardized_rate_df`, since it uses the same row-count-based denominator logic as `crude_rate_df`.
+The end-of-period note is always first. `Zero events` and `Low event count` are mutually exclusive.
 
-------------------------------------------------------------------------
+### DSP notes
 
-## 6. Worked Example
+| Exact note text | Trigger | Interpretation/action |
+|---|---|---|
+| `Reference population: full standardisation weights used; the standardised estimate equals the overall observed proportion.` | Overall reference row | All empirical reference strata are present; the reference DSP equals the full-data crude proportion. |
+| `Calculated with missing standardisation stratum: 1 stratum omitted, representing {missing%} of the reference population; the remaining reference weights ({coverage%} coverage) were renormalised to sum to 1.` | One positively weighted reference stratum is absent from a non-reference group | The effective standard population excludes that stratum. Percentages are displayed to one decimal place. |
+| `Calculated with missing standardisation strata: {count} strata omitted, representing {missing%} of the reference population; the remaining reference weights ({coverage%} coverage) were renormalised to sum to 1.` | More than one positively weighted reference stratum is absent | Same as above, with plural wording. |
+| `Unreliable: stratum n < 10.` | At least one observed stratum has `0 < n_i < 10` | A stratum-level proportion is based on fewer than 10 rows. |
+| `Unreliable: stratum non-event count < 10.` | At least one observed stratum has `0 < n_i - events_i < 10` | At least one stratum has a sparse non-event complement. A stratum with zero non-events does not trigger this fragment. |
+| `Zero events.` | Total group events equal zero | The DSP point estimate is zero; the Wilson-MOVER upper limit can remain positive. |
+| `Low event count (<10).` | Total group events are from 1 to 9 | The DSP is returned but has a low total event count. |
+| `All events (proportion = 1).` | Every row in the group is an event | The DSP point estimate is one; its lower limit can remain below one. |
+| `Low non-event count (<10).` | Total group non-events are from 1 to 9 | The group has a sparse total non-event complement. |
 
-Given a dataset of patient-level records with an `alliance` group column, an `age` and `sex` stratum column, and a binary `event` column, calling `directly_standardized_proportion_df(df, "event", ["age", "sex"], ["alliance"])` on three alliances (A, B, C) against a population event rate of 19.5% might produce:
+The reference note is first when present, followed by missing-strata, stratum-level, and total-count notes. No Haldane-Anscombe correction is used or reported. A well-populated, complete non-reference group can have an empty `notes` value.
 
-| alliance | events | n | dsp | dsp_lower | dsp_upper | notes | significance |
-|---|---|---|---|---|---|---|---|
-| A | 90 | 300 | 0.302 | 0.253 | 0.357 | | Higher |
-| B | 30 | 300 | 0.101 | 0.072 | 0.140 | | Lower |
-| C | 0 | 15 | 0.163 | 0.163 | 0.163 | Haldane correction applied \| Zero events | Lower |
-| Overall | 120 | 615 | 0.195 | 0.166 | 0.228 | Overall proportion: no weighting applied as this row is itself the reference population | Reference |
+### DSR notes
 
-Reading this table: Alliance A's confidence interval (0.253–0.357) sits entirely above the Overall proportion of 0.195, so it is flagged `"Higher"`. Alliance B's interval (0.072–0.140) sits entirely below the Overall figure, so it is flagged `"Lower"`. Alliance C has zero raw events, but because one of its strata triggered the Haldane correction, its standardised estimate is not exactly zero — its resulting interval still sits below the Overall figure, earning a `"Lower"` label, but the `Zero events` flag in `notes` is an important caveat: this group's estimate should be treated with more caution than Alliance A or B's, given it is built from a very small, entirely event-free sample.
+| Exact note text | Trigger | Interpretation/action |
+|---|---|---|
+| `End-of-period denominator: row count used as exposure (assumes each row represents one patient present at the period end and does not account for partial-period exposure).` | Every DSR row | Confirms that each row contributes one unit of exposure. |
+| `Reference population: full standardisation weights used.` | Overall reference row | All empirical reference weights are used. |
+| `Calculated with missing standardisation stratum: 1 stratum omitted, representing {missing%} of the reference population; the remaining reference weights ({coverage%} coverage) were renormalised to sum to 1.` | One positively weighted reference stratum is absent from a non-reference group | The effective standard population excludes that stratum. Percentages are displayed to one decimal place. |
+| `Calculated with missing standardisation strata: {count} strata omitted, representing {missing%} of the reference population; the remaining reference weights ({coverage%} coverage) were renormalised to sum to 1.` | More than one positively weighted reference stratum is absent | Same as above, with plural wording. |
+| `Unreliable: stratum denominator < 10.` | At least one observed stratum has `0 < denominator_i < 10` | At least one stratum rate uses fewer than 10 rows of exposure. |
+| `Zero total events: the DSR point estimate may be zero, but the Poisson-MOVER upper confidence limit remains positive.` | Total group events equal zero | Explains the non-zero upper limit at a zero point estimate. |
+| `Low total event count (<10): DSR calculated but should be treated as unstable and may be unsuitable for publication.` | Total group events are below 10, including zero | The DSR is returned rather than suppressed. |
+
+The end-of-period note is always first. A zero-event DSR receives both the `Zero total events` and `Low total event count (<10)` fragments. There is no separate DSR note for a low event count within an individual stratum; exact versus Byar stratum treatment is recorded in `method`.
+
+## Missing-strata example
+
+Suppose the full input has reference weights 66.7% for stratum A and 33.3% for stratum B, but subgroup G1 has no rows in B. The standardised functions omit B and renormalise A's retained weight to 1. The subgroup note is:
+
+```text
+Calculated with missing standardisation stratum: 1 stratum omitted,
+representing 33.3% of the reference population; the remaining reference
+weights (66.7% coverage) were renormalised to sum to 1.
+```
+
+This result should not be interpreted as though G1 had a zero outcome in B. It is an estimate for the retained standard-population coverage and may not be directly comparable when different groups omit different or substantial reference shares.
+
+## Publication checks
+
+Before publishing output:
+
+- review every non-empty `notes` value and apply the organisation's disclosure-control and suppression rules;
+- confirm that row count is a defensible exposure denominator for rate outputs;
+- inspect missing-reference-weight coverage for standardised outputs;
+- avoid treating `significance` as a formal hypothesis test;
+- consider multiplicity when many cube cells are compared;
+- retain `method`, `confidence`, and `multiplier` with extracts so the estimates remain interpretable.

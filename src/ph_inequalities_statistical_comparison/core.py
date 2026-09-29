@@ -899,7 +899,8 @@ def _missing_strata_note(
         f"{missing_reference_weight:.1%} of the reference population; "
         "the remaining reference weights "
         f"({observed_reference_weight:.1%} coverage) were "
-        "renormalised to sum to 1."
+        "renormalised to sum to 1 "
+        "Strongly consider coarsening strata, inequalities or dimensions"
     )
 
 
@@ -1612,11 +1613,14 @@ def _crude_proportion_notes(
 
     else:
         if events == 0:
-            notes.append("Zero events - confidence intervals may be unstable.")
+            notes.append(
+                "No events (proportion = 0) - must either flag as a boundary "
+                "estimate or suppress in visual outputs."
+            )
 
         elif events < 10:
             notes.append(
-                "Low event count (<10) - flag as unstable or suppress "
+                "Low event count (<10) - must flag as unstable or suppress "
                 "in visual outputs."
             )
 
@@ -1630,7 +1634,8 @@ def _crude_proportion_notes(
 
         elif non_events < 10:
             notes.append(
-                "Low non-event count (<10) - confidence intervals may be unstable."
+                "Low non-event count (<10) - must flag as unstable or suppress "
+                "in visual outputs."
             )
 
     if 0 < n < 40:
@@ -1660,7 +1665,10 @@ def _crude_rate_notes(
 
     else:
         if events == 0:
-            notes.append("Zero events - confidence intervals may be unstable.")
+            notes.append(
+                "Zero event count - flag as unstable or suppress "
+                "in visual outputs."
+            )
 
         elif events < 10:
             notes.append(
@@ -2123,7 +2131,10 @@ def directly_standardized_proportion_df(
         if any(
             0 < denominator < 10 for denominator in stratum_statistics["raw_stratum_ns"]
         ):
-            notes.append("Unreliable: stratum n < 10.")
+            notes.append(
+                "Unreliable: at least one stratum has n < 10 "
+                "flag as unstable or suppress in visual outputs and strongly consider coarsening strata, inequalities or dimensions"
+            )
 
         non_events_by_stratum = [
             float(denominator) - float(stratum_events)
@@ -2138,21 +2149,37 @@ def directly_standardized_proportion_df(
         ]
 
         if any(0 < count < 10 for count in non_events_by_stratum):
-            notes.append("Unreliable: stratum non-event count < 10.")
+            notes.append(
+                "Unreliable: stratum non-event count < 10 "
+                "flag as unstable or suppress in visual outputs and strongly consider coarsening strata, inequalities or dimensions"
+            )
 
         non_events = n - events
 
         if events == 0:
-            notes.append("Zero events.")
+            notes.append(
+                "Zero total events "
+                "flag as unstable or suppress in visual outputs"
+            )
 
         elif events < 10:
-            notes.append("Low event count (<10).")
+            notes.append(
+                "low total event count (<10) "
+                "flag as unstable or suppress in visual outputs"
+            )
 
         if n > 0 and non_events == 0:
-            notes.append("All events (proportion = 1).")
+            notes.append(
+                "All events (proportion = 1) "
+                "flag as unstable or suppress in visual outputs"
+            )
 
         elif 0 < non_events < 10:
-            notes.append("Low non-event count (<10).")
+            notes.append(
+                "Low non-event count (<10) "
+                "flag as unstable or suppress in visual outputs"
+
+            )
 
         records.append(
             {
@@ -2384,20 +2411,21 @@ def directly_standardized_rate_df(
             0 < stratum_denominator < 10
             for stratum_denominator in stratum_statistics["raw_stratum_denominators"]
         ):
-            notes.append("Unreliable: stratum denominator < 10.")
+            notes.append(
+                "Unreliable: stratum denominator < 10 "
+                "flag as unstable or suppress in visual outputs and strongly consider coarsening strata, inequalities or dimensions"
+            )
 
         if events == 0:
             notes.append(
-                "Zero total events: the DSR point estimate may be zero, "
-                "but the Poisson-MOVER upper confidence limit remains "
-                "positive."
+                "Zero total events "
+                "flag as unstable or suppress in visual outputs"
             )
 
         if events < 10:
             notes.append(
-                "Low total event count (<10): DSR calculated but should "
-                "be treated as unstable and may be unsuitable for "
-                "publication."
+                "Low total event count (<10) "
+                "flag as unstable or suppress in visual outputs"
             )
 
         exact_strata_count = int(
