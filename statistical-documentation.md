@@ -1,157 +1,246 @@
-## Purpose
+# Statistical methodology
 
-This document explains, purely from a statistical standpoint, how each of the four public functions in `ph_inequalities_statistical_comparison.py` derives (1) its point estimate, (2) its confidence interval, and (3) its determination of statistical significance against the reference (Overall) value. Each function is addressed in turn.
+## Scope
 
-------------------------------------------------------------------------
+This document describes the implemented statistical approach for the four public functions:
 
-## 1. `crude_proportion_df`
+- `crude_proportion_df()`;
+- `crude_rate_df()`;
+- `directly_standardized_proportion_df()`;
+- `directly_standardized_rate_df()`.
 
-### Point estimate
+The functions calculate estimates and two-sided confidence intervals for every generated grouping. The confidence level is controlled by `confidence` and defaults to 0.95. Low-count results are returned with quality notes; the package does not suppress them.
 
-Each row in the input data is treated as an independent Bernoulli trial — a binary 0/1 (or boolean) event indicator. Summed across all rows within a group, the total event count follows a Binomial(n, p) distribution, where n is the group's row count and p is the true, unknown probability of the event. The point estimate is the maximum likelihood estimator of p:
+## Common reference comparison
 
-\[
-\hat{p} = \frac{\text{events}}{n}
-\]
+Each function adds a `significance` label by comparing a result's confidence interval with the estimate for the overall row, where every inequality and organisational dimension equals `all_label` (default: `"All"`). The overall estimate is treated as a fixed benchmark:
 
-No adjustment is made for underlying differences in age, sex, or other population structure between groups — every row contributes equally to the pooled count, regardless of which stratum it falls into. This is what makes the estimate "crude" rather than standardised.
+- `Higher` when the reference estimate is below the result's lower confidence limit;
+- `Lower` when the reference estimate is above the result's upper confidence limit;
+- `Not significant` when the reference lies within the closed interval;
+- `Not tested` when the reference or either confidence limit is non-finite;
+- `Reference` for the overall row itself.
 
-### Confidence interval
+This is a descriptive confidence-interval classification, not a formal between-group hypothesis test. It does not propagate uncertainty in the overall estimate, account for dependence between a subgroup and an overall population that contains it, produce a p-value, or adjust for multiple comparisons.
 
-The interval is constructed using the **Wilson score method**, a closed-form approximation derived from inverting the normal approximation to the binomial distribution around a shrinkage-adjusted centre rather than around \(\hat{p}\) itself:
-
-\[
-\text{center} = \frac{\hat{p} + \frac{z^2}{2n}}{1 + \frac{z^2}{n}}, \qquad
-\text{half-width} = \frac{z\sqrt{\frac{\hat{p}(1-\hat{p})}{n} + \frac{z^2}{4n^2}}}{1 + \frac{z^2}{n}}
-\]
-
-where \(z\) is the standard normal critical value corresponding to the chosen confidence level. The lower and upper bounds are \(\text{center} \mp \text{half-width}\), clipped to \([0, 1]\). This re-centring is what allows the interval to remain a genuine, non-degenerate range even when \(\hat{p} = 0\) or \(\hat{p} = 1\) — the half-width does not collapse to zero at either boundary, because the \(z^2/(4n^2)\) term inside the square root survives even when \(\hat{p}(1-\hat{p}) = 0\). This behaviour is the specific reason Wilson score is used here rather than the simpler Wald interval, which is known to produce zero-width or out-of-range intervals at these boundaries.
-
-### Statistical significance against the reference
-
-No formal hypothesis test (no p-value, no test statistic) is computed. Instead, the Overall group's proportion is treated as a **fixed, known benchmark** rather than a random variable with its own sampling uncertainty, and each non-Overall group is classified purely by whether that fixed value falls inside or outside the group's own Wilson score interval:
-
-- Reference value below the group's lower bound → the group's estimate is classified **"Higher"**.
-- Reference value above the group's upper bound → the group's estimate is classified **"Lower"**.
-- Reference value within \([\text{lower}, \text{upper}]\) → **"Not significant"**.
-
-This is a confidence-interval-overlap heuristic, not a two-sample or one-sample hypothesis test — it implicitly answers "is the reference value a plausible value for this group's true proportion, given the precision of this group's own estimate?" rather than computing a probability of observing data this extreme under a null hypothesis.
-
-------------------------------------------------------------------------
-
-## 2. `crude_rate_df`
+## Crude proportion
 
 ### Point estimate
 
-Here the observed event count is modelled as a **Poisson**-distributed count rather than a bounded binomial count, because `event_col` is permitted to take any non-negative integer value per row (e.g. multiple events for a single patient), not just 0 or 1. The denominator is derived from row count — each row is treated as one unit of exposure — rather than supplied externally. The point estimate is:
+`crude_proportion_df()` requires a row-level binary event indicator. Boolean values are converted to integers; otherwise the event column must contain integers in `{0, 1}`.
+
+For a result group with event count \(x\) and row count \(n\), the crude proportion is
 
 \[
-\hat{r} = \frac{\text{events}}{\text{denominator}} \times \text{multiplier}
+\hat{p} = \frac{x}{n}.
 \]
 
-where the multiplier rescales the rate to a conventional reporting base (e.g. per 100,000).
+Every row has equal weight. No standardisation is applied.
 
-### Confidence interval
+### Wilson score interval
 
-The interval is built directly around the observed **count**, then divided through by the denominator and multiplier. Two different methods are used depending on the size of the count:
+Let \(C\) be the requested confidence level, \(\alpha = 1-C\), and \(z = \Phi^{-1}(1-\alpha/2)\). The Wilson centre and half-width are
 
-- For counts of 10 or more, **Byar's approximation** is used — a closed-form formula based on a cube-root normalising transformation of the Poisson count, chosen for its computational simplicity and accuracy at moderate-to-large counts.
-- For counts below 10, an **exact chi-square-based Poisson interval** is used instead, exploiting the exact mathematical relationship between the Poisson distribution's cumulative probabilities and quantiles of the chi-square distribution (with degrees of freedom \(2 \times \text{count}\) or \(2 \times (\text{count}+1)\)). This exact method is substituted below the count-of-10 threshold because Byar's approximation becomes progressively less accurate as the count shrinks, particularly at zero.
+\[
+\text{centre} =
+\frac{\hat{p} + z^2/(2n)}{1 + z^2/n},
+\]
 
-### Statistical significance against the reference
+\[
+\text{half-width} =
+\frac{z\sqrt{\hat{p}(1-\hat{p})/n + z^2/(4n^2)}}
+     {1 + z^2/n}.
+\]
 
-As with `crude_proportion_df`, no formal test is performed. The Overall group's rate is treated as fixed, and each group's classification is again determined purely by CI overlap: **"Higher"** if the reference rate falls below the group's lower bound, **"Lower"** if it falls above the group's upper bound, and **"Not significant"** if the reference rate falls within the group's interval.
+The interval is
 
-------------------------------------------------------------------------
+\[
+L = \max(0,\text{centre}-\text{half-width}), \qquad
+U = \min(1,\text{centre}+\text{half-width}).
+\]
 
-## 3. `directly_standardized_proportion_df`
+The Wilson construction remains non-degenerate at observed proportions of 0 and 1 and keeps limits within `[0, 1]`.
+
+## Crude rate
+
+### Exposure and estimate
+
+`crude_rate_df()` accepts a non-negative integer count per row. A row may contain more than one event. The function creates an internal exposure value of one for every row, so the group denominator \(D\) is the group's row count.
+
+For total event count \(x\) and reporting multiplier \(M\),
+
+\[
+\hat{r} = \frac{x}{D}M.
+\]
+
+The default is \(M=100{,}000\). This is an end-of-period denominator: it assumes each row represents one person present at period end and does not account for partial-period person-time.
+
+### Poisson count intervals
+
+The function first calculates a confidence interval for the event count, then divides both limits by \(D\) and multiplies by \(M\).
+
+For \(x<10\), it uses the exact chi-square Poisson interval:
+
+\[
+L_x =
+\begin{cases}
+0, & x=0,\\
+\frac{1}{2}\chi^2_{\alpha/2,\,2x}, & x>0,
+\end{cases}
+\]
+
+\[
+U_x = \frac{1}{2}\chi^2_{1-\alpha/2,\,2(x+1)}.
+\]
+
+For \(x\geq10\), it uses Byar's approximation:
+
+\[
+L_x = x\left(1-\frac{1}{9x}-\frac{z}{3\sqrt{x}}\right)^3,
+\]
+
+\[
+U_x = (x+1)\left(1-\frac{1}{9(x+1)}+
+\frac{z}{3\sqrt{x+1}}\right)^3.
+\]
+
+The reported limits are
+
+\[
+L = \frac{L_x}{D}M, \qquad U = \frac{U_x}{D}M.
+\]
+
+An observed count of zero therefore produces a rate and lower limit of zero but a positive upper limit.
+
+## Reference weights
+
+Both directly standardised functions derive the standard population internally from the full input dataframe after input validation and any automatic numeric-stratum binning.
+
+For joint stratum \(i\), let \(N_i^{\mathrm{ref}}\) be the number of rows in the full input and let \(N^{\mathrm{ref}}\) be the full input row count. The reference weight is
+
+\[
+w_i = \frac{N_i^{\mathrm{ref}}}{N^{\mathrm{ref}}}.
+\]
+
+With multiple `strata_cols`, weights are calculated for the observed combinations of all stratum columns. The package does not use an external standard population such as the European Standard Population.
+
+Numeric stratum columns are automatically converted to `Q1`-`Q4` using the full column's 25th, 50th, and 75th percentiles with linear interpolation. Values equal to a cut point are assigned to the lower quartile. Ties can therefore result in fewer than four observed labels. Non-numeric strata are used as supplied.
+
+## Missing strata
+
+For a subgroup, a positively weighted reference stratum is considered missing when that subgroup has no rows in the stratum. Missing strata are omitted rather than assigned a zero event risk or rate. If \(O_g\) is the set of observed, positively weighted strata for group \(g\), the retained weights are renormalised:
+
+\[
+w_{ig}^{*} = \frac{w_i}{\sum_{j\in O_g} w_j},
+\qquad i\in O_g.
+\]
+
+The `notes` column reports the number of omitted strata, their combined share of the reference population, and the retained coverage. This makes the result calculable but changes the effective standard population for that subgroup; comparisons should therefore be treated cautiously when omitted reference weight is material.
+
+## Directly standardised proportion
 
 ### Point estimate
 
-This function still models each stratum's event count as Binomial(n_stratum, p_stratum), but instead of pooling all strata into a single crude proportion, it computes a proportion **separately within each stratum** (e.g. each age band) for the group, then combines those stratum proportions using **fixed weights derived from the full dataset's stratum composition** — not the group's own stratum sizes. This is the defining feature of direct standardisation: it removes the influence of the group having a different demographic mix than the reference population, isolating differences in stratum-specific rates from differences in demographic composition.
-
-Where a stratum sits exactly at a 0% or 100% boundary (zero events, or all rows being events), a **Haldane-Anscombe continuity correction** is applied to that stratum before it enters the weighted sum — 0.5 is added to that stratum's event count and 1.0 to its row count. This prevents a boundary stratum from contributing exactly zero variance to the standardised calculation, which would otherwise understate the overall estimate's uncertainty regardless of how much data that stratum actually contained.
-
-The point estimate is the reference-weighted sum of the (possibly Haldane-corrected) stratum proportions:
+Within each observed stratum \(i\), the uncorrected observed proportion is
 
 \[
-\text{DSP} = \sum_i w_i \, p_i
+\hat{p}_i = \frac{x_i}{n_i}.
 \]
 
-where \(w_i\) is stratum \(i\)'s reference weight and \(p_i\) is the group's proportion within stratum \(i\).
+The directly standardised proportion (DSP) is
 
-### Confidence interval
-
-The interval is constructed using the **Wilson-Dobson** method, which proceeds in two stages:
-
-1. **Compute the standardised variance** directly from the stratum-level binomial variances, weighted by the reference weights:
 \[
-\text{Var}(\text{DSP}) = \frac{\sum_i w_i^2 \, p_i(1-p_i)/n_i}{\left(\sum_i w_i\right)^2}
+\widehat{DSP} = \sum_{i\in O_g} w_{ig}^{*}\hat{p}_i.
 \]
-2. **Rescale the crude proportion's Wilson score interval** to reflect this standardised variance, rather than deriving an entirely new interval formula. The crude (unweighted, unstandardised) proportion's own Wilson bounds \((\hat p_{\text{lo}}, \hat p_{\text{hi}})\) are computed first, then a scale factor \(\text{scale} = \sqrt{\text{Var}(\text{DSP}) / \text{Var}(\hat p_{\text{crude}})}\) is applied to shift those bounds around the DSP point estimate:
+
+No Haldane-Anscombe or other continuity correction is applied to the event counts or denominators. Consequently, all-zero strata contribute a point estimate of zero and all-event strata contribute one.
+
+### Wilson-MOVER interval
+
+A Wilson interval \([L_i,U_i]\) is calculated separately for each observed stratum. The Method of Variance Estimates Recovery (MOVER) combines the distances between each stratum estimate and its Wilson limits:
+
 \[
-\text{lower} = \text{DSP} + \text{scale} \times (\hat p_{\text{lo}} - \hat p_{\text{crude}}), \qquad
-\text{upper} = \text{DSP} + \text{scale} \times (\hat p_{\text{hi}} - \hat p_{\text{crude}})
+L_{DSP} = \max\left(
+0,
+\widehat{DSP} -
+\sqrt{\sum_{i\in O_g}(w_{ig}^{*})^2(\hat{p}_i-L_i)^2}
+\right),
 \]
 
-This "borrow the shape, rescale the width" construction is deliberate: it inherits the Wilson interval's boundary-respecting behaviour (bounds remain within \([0,1]\)) while correctly reflecting the variance of the *standardised* estimate rather than the crude one, which a plain reuse of the crude Wilson interval would not do.
+\[
+U_{DSP} = \min\left(
+1,
+\widehat{DSP} +
+\sqrt{\sum_{i\in O_g}(w_{ig}^{*})^2(U_i-\hat{p}_i)^2}
+\right).
+\]
 
-### Statistical significance against the reference
+The point estimate and limits are rounded to six decimal places in the public output.
 
-Once again, no formal hypothesis test is computed. The Overall row's **crude** proportion (not a standardised value — see below) is treated as the fixed reference, and each group's DSP is classified by whether that fixed value falls inside or outside the group's Wilson-Dobson interval, using the same three-way logic as the crude functions: **"Higher"**, **"Lower"**, or **"Not significant"**.
+### Overall reference
 
-Note that the Overall row's own value is the crude proportion of the full dataset rather than a re-run of the standardisation logic, because the Overall row's population *is* the reference population used to build the standardisation weights in the first place — standardising the whole population against itself would simply return the same crude value.
+For the overall row, every reference stratum is observed and the empirical reference weights are proportional to the same stratum denominators used in the calculation. The overall DSP therefore equals the full input's observed crude proportion. Its interval remains the Wilson-MOVER interval, not the crude Wilson interval.
 
-------------------------------------------------------------------------
-
-## 4. `directly_standardized_rate_df`
+## Directly standardised rate
 
 ### Point estimate
 
-This is the rate counterpart of DSP: each stratum's event count is modelled as **Poisson** rather than binomial, and stratum-level rates (events divided by the row-count-derived denominator within that stratum) are combined using the same fixed reference weights used in the proportion function. Where a stratum has zero events, a **Haldane-style correction** is applied (adding 0.5 to events and 1.0 to the denominator) — unlike DSP, this correction is only needed at the lower (zero-event) boundary, since a Poisson rate has no natural upper bound the way a proportion is capped at 1.
-
-The point estimate is the reference-weighted average of the stratum rates:
+The rate function again assigns exposure one to each row. Within stratum \(i\), let \(x_i\) be the summed count and \(D_i\) the number of rows. The unscaled observed rate is
 
 \[
-\text{DSR} = \frac{\sum_i w_i \, r_i}{\sum_i w_i} \times \text{multiplier}
+\hat{r}_i = \frac{x_i}{D_i}.
 \]
 
-where \(r_i\) is the group's (possibly Haldane-corrected) rate within stratum \(i\).
+The directly standardised rate (DSR), scaled by \(M\), is
 
-### Confidence interval
-
-The interval is constructed using the **Dobson-Byar** method, mirroring the two-stage logic used for DSP but adapted to Poisson counts:
-
-1. **Compute the standardised variance** from the stratum-level Poisson variances:
 \[
-\text{Var}(\text{DSR}) = \frac{\sum_i w_i^2 \, O_i / n_i^2}{\left(\sum_i w_i\right)^2}
+\widehat{DSR} =
+M\sum_{i\in O_g} w_{ig}^{*}\hat{r}_i.
 \]
-where \(O_i\) is the stratum's event count and \(n_i\) its denominator.
-2. **Rescale the crude event count's Byar or exact-chi-square interval** (chosen by the same count-of-10 threshold used in `crude_rate_df`) by the ratio of standardised-to-crude variance:
+
+Counts and denominators are uncorrected; no Haldane-Anscombe correction is applied.
+
+### Poisson-MOVER interval
+
+For each observed stratum, the package calculates an interval for \(x_i\): exact chi-square when \(x_i<10\) and Byar when \(x_i\geq10\). Dividing the count limits by \(D_i\) gives stratum rate limits \([L_i,U_i]\). These are combined as
+
 \[
-\text{scale} = \sqrt{\text{Var}(\text{DSR}) / \text{crude events}}
+L_{DSR} = M\max\left(
+0,
+\widehat{r} -
+\sqrt{\sum_{i\in O_g}(w_{ig}^{*})^2(\hat{r}_i-L_i)^2}
+\right),
 \]
+
 \[
-\text{lower} = \text{DSR}_{\text{unscaled}} + \text{scale} \times (O_{\text{lo}} - \text{crude events}), \qquad
-\text{upper} = \text{DSR}_{\text{unscaled}} + \text{scale} \times (O_{\text{hi}} - \text{crude events})
+U_{DSR} = M\left(
+\widehat{r} +
+\sqrt{\sum_{i\in O_g}(w_{ig}^{*})^2(U_i-\hat{r}_i)^2}
+\right),
 \]
-before finally applying the multiplier to bring the bounds onto the reported rate scale.
 
-This is structurally identical to the Wilson-Dobson approach for DSP, substituting the Poisson-appropriate crude interval (Byar/exact-chi-square) for the binomial-appropriate one (Wilson), for the same reason: it preserves the crude interval's guarantee of remaining non-negative while correctly reflecting the standardised estimate's own variance.
+where
 
-### Statistical significance against the reference
+\[
+\widehat{r}=\sum_{i\in O_g}w_{ig}^{*}\hat{r}_i.
+\]
 
-As with all three preceding functions, significance is established purely via confidence-interval overlap against a fixed reference value — here, the Overall row's crude rate (again, unstandardised, for the same reason given for DSP). No p-value or formal test statistic is computed; the classification is **"Higher"**, **"Lower"**, or **"Not significant"** depending on whether that fixed crude rate falls outside or within the group's Dobson-Byar interval.
+The `method` value states whether the result used exact stratum intervals, Byar stratum intervals, or both. The estimate and limits are rounded to six decimal places after applying the multiplier.
 
-------------------------------------------------------------------------
+A DSR with fewer than 10 total events is still returned. It is flagged in `notes` as unstable and potentially unsuitable for publication. With zero total events, the point estimate and lower limit are zero while the Poisson-MOVER upper limit remains positive.
 
-## Summary Table
+### Overall reference
 
-| Function | Underlying distribution | Point estimate basis | CI method | Significance basis |
-|---|---|---|---|---|
-| `crude_proportion_df` | Binomial | Pooled events / n | Wilson score | CI-overlap vs. fixed Overall proportion |
-| `crude_rate_df` | Poisson | Pooled events / row-count denominator | Byar (≥10) / exact chi-square (<10) | CI-overlap vs. fixed Overall rate |
-| `directly_standardized_proportion_df` | Binomial per stratum | Reference-weighted sum of stratum proportions (Haldane-corrected at boundaries) | Wilson-Dobson (rescaled Wilson) | CI-overlap vs. fixed Overall (crude) proportion |
-| `directly_standardized_rate_df` | Poisson per stratum | Reference-weighted average of stratum rates (Haldane-corrected at zero) | Dobson-Byar (rescaled Byar/exact) | CI-overlap vs. fixed Overall (crude) rate |
+For the overall row, empirical reference weights and row-count stratum denominators reproduce the full input's crude rate. The confidence interval remains a Poisson-MOVER interval and can differ from the crude rate interval.
 
-Across all four functions, the significance determination is uniform in design: none perform a formal hypothesis test, and all rely on treating the reference value as fixed and checking whether it falls inside or outside the group's own interval — the only thing that varies between functions is *which* distribution and *which* CI construction produces that interval in the first place.
+## Interpretation and assumptions
+
+The calculations rely on the following substantive assumptions and limitations:
+
+- Rows should represent independent observational units for proportion analyses and valid units of end-of-period exposure for rate analyses.
+- The Poisson rate model assumes the count and exposure representation is appropriate; the package does not model overdispersion or recurrent-event dependence.
+- Standardisation controls only for the supplied strata and uses the full input as the standard population.
+- Renormalisation for missing strata makes an estimate possible but means different subgroups can be standardised to different retained portions of the reference distribution.
+- `significance` is descriptive, treats the overall estimate as fixed, and is not a replacement for a formal model or hypothesis test.
+- No multiple-testing adjustment is applied across the potentially large inequality and organisational output cube.
+- Quality notes identify predefined count and denominator conditions but do not automatically suppress, redact, or approve results for publication.
