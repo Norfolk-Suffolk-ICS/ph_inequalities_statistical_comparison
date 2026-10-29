@@ -1591,6 +1591,53 @@ def _compute_rate_stratum_stats(
         "exact_strata_count": exact_strata_count,
         "byar_strata_count": byar_strata_count,
     }
+ 
+
+# ===========================================================================
+# Actions
+# ===========================================================================
+
+
+def _crude_proportion_action(
+    events: float,
+    n: float,
+) -> str:
+    """Decide whether to Show, Flag or Suppress a crude proportion."""
+    non_events = n - events
+ 
+    # nothing to divide by
+    if n == 0:
+        return "Suppress"
+ 
+    # both counts are small, so the estimate is not reliable either way
+    if events < 10 and non_events < 10:
+        return "Suppress"
+ 
+    # at least one quality warning
+    if events < 10 or non_events < 10 or n < 40:
+        return "Flag"
+ 
+    return "Show"
+ 
+ 
+def _crude_rate_action(
+    events: float,
+    denominator: float,
+) -> str:
+    """Decide whether to Show, Flag or Suppress a crude rate."""
+    # nothing to divide by
+    if denominator <= 0:
+        return "Suppress"
+ 
+    # few events on a small population
+    if events < 10 and denominator < 40:
+        return "Suppress"
+ 
+    # at least one quality warning
+    if events < 10 or denominator < 40:
+        return "Flag"
+ 
+    return "Show"
 
 
 # ===========================================================================
@@ -1804,6 +1851,10 @@ def crude_proportion_df(
                 "upper": upper,
                 "confidence": confidence,
                 "method": "Wilson score",
+                "action": _crude_proportion_action(
+                    events,
+                    n,
+                ),
                 "notes": _crude_proportion_notes(
                     events,
                     n,
@@ -1965,6 +2016,10 @@ def crude_rate_df(
                 "multiplier": multiplier,
                 "confidence": confidence,
                 "method": method,
+                "action": _crude_rate_action(
+                    events,
+                    denominator,
+                ),
                 "notes": _crude_rate_notes(
                     events,
                     denominator,
