@@ -1605,16 +1605,20 @@ def _crude_proportion_action(
     """Decide whether to Show, Flag or Suppress a crude proportion."""
     non_events = n - events
  
-    # nothing to divide by
+    # nothing to divide  (Zero denominator)
     if n == 0:
         return "Suppress"
- 
-    # both counts are small, so the estimate is not reliable either way
-    if events < 10 and non_events < 10:
+    
+    # small sample AND a low count -> not reliable enough to show
+    if n < 40 and (events < 10 or non_events < 10):
         return "Suppress"
- 
-    # at least one quality warning
-    if events < 10 or non_events < 10 or n < 40:
+
+    # small sample, but both counts are fine
+    if n < 40:
+        return "Flag"
+
+    # adequate sample, but a low count
+    if events < 10 or non_events < 10:
         return "Flag"
  
     return "Show"
@@ -1637,6 +1641,73 @@ def _crude_rate_action(
     if events < 10 or denominator < 40:
         return "Flag"
  
+    return "Show"
+
+
+def _ds_proportion_action(
+    events: float,
+    n: float,
+    missing_strata_count: int,
+    raw_stratum_ns: Sequence[float],
+    observed_reference_weight: float,
+) -> str:
+    """Decide whether to Show, Flag or Suppress a directly standardised proportion."""
+    non_events = n - events
+
+    # too little data, or too much of the reference population missing
+    if observed_reference_weight < 0.90 or n < 20:
+        return "Suppress"
+
+    # each warning is True or False
+    warnings = [
+        n < 40,
+        events < 10,
+        non_events < 10,
+        missing_strata_count > 0,
+        any(0 < stratum_n < 10 for stratum_n in raw_stratum_ns),
+    ]
+
+    # sum() counts how many are True (True = 1, False = 0)
+    warning_count = sum(warnings)
+
+    if warning_count >= 2:
+        return "Suppress"
+
+    if warning_count == 1:
+        return "Flag"
+
+    return "Show"
+
+
+def _ds_rate_action(
+    events: float,
+    denominator: float,
+    missing_strata_count: int,
+    raw_stratum_denominators: Sequence[float],
+    observed_reference_weight: float,
+) -> str:
+    """Decide whether to Show, Flag or Suppress a directly standardised rate."""
+    # small population AND too much of the reference population missing
+    if denominator < 20 and observed_reference_weight < 0.90:
+        return "Suppress"
+
+    # each warning is True or False
+    warnings = [
+        events < 10,
+        missing_strata_count > 0,
+        denominator < 40,
+        any(0 < stratum_d < 10 for stratum_d in raw_stratum_denominators),
+    ]
+
+    # sum() counts how many are True (True = 1, False = 0)
+    warning_count = sum(warnings)
+
+    if warning_count >= 2:
+        return "Suppress"
+
+    if warning_count == 1:
+        return "Flag"
+
     return "Show"
 
 
@@ -2267,6 +2338,15 @@ def directly_standardized_proportion_df(
                 ),
                 "confidence": confidence,
                 "method": "Wilson-MOVER",
+                "action": _ds_proportion_action(
+                    events=events,
+                    n=n,
+                    missing_strata_count=missing_strata_count,
+                    raw_stratum_ns=stratum_statistics["raw_stratum_ns"],
+                    observed_reference_weight=float(
+                        stratum_statistics["observed_reference_weight"],
+                    ),
+                ),
                 "notes": " | ".join(notes),
                 "significance": (
                     "Reference"
@@ -2526,6 +2606,15 @@ def directly_standardized_rate_df(
                 "multiplier": multiplier,
                 "confidence": confidence,
                 "method": method,
+                "action": _ds_rate_action(
+                    events=events,
+                    denominator=denominator,
+                    missing_strata_count=missing_strata_count,
+                    raw_stratum_denominators=stratum_statistics["raw_stratum_denominators"],
+                    observed_reference_weight=float(
+                        stratum_statistics["observed_reference_weight"],
+                    ),
+                ),
                 "notes": " | ".join(notes),
                 "significance": (
                     "Reference"
