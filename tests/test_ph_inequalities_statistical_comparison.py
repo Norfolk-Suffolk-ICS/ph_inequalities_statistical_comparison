@@ -23,8 +23,12 @@ from ph_inequalities_statistical_comparison.core import (
     _build_grouping_sets,
     _byar_count_ci,
     _check_no_missing_or_nonfinite,
+    _crude_proportion_action,
+    _crude_rate_action,
     _compute_proportion_stratum_stats,
     _compute_rate_stratum_stats,
+    _ds_proportion_action,
+    _ds_rate_action,
     _exact_poisson_count_ci,
     _inequality_states,
     _missing_strata_note,
@@ -1940,6 +1944,7 @@ def test_crude_proportion_output_schema() -> None:
         "upper",
         "confidence",
         "method",
+        "action",
         "notes",
         "significance",
     ]
@@ -2106,6 +2111,7 @@ def test_crude_rate_output_schema() -> None:
         "multiplier",
         "confidence",
         "method",
+        "action",
         "notes",
         "significance",
     ]
@@ -2491,6 +2497,7 @@ def test_dsp_output_schema() -> None:
         "dsp_upper",
         "confidence",
         "method",
+        "action",
         "notes",
         "significance",
     ]
@@ -2785,6 +2792,7 @@ def test_dsr_output_schema() -> None:
         "multiplier",
         "confidence",
         "method",
+        "action",
         "notes",
         "significance",
     ]
@@ -2946,6 +2954,7 @@ def test_all_functions_support_dimensions(
         "region",
         "icb",
         "sex",
+        "action",
         "notes",
         "significance",
     } <= set(result.columns)
@@ -3042,3 +3051,308 @@ def test_estimates_lie_within_confidence_intervals(
     assert finite.select(
         (pl.col(estimate_col) <= pl.col(upper_col)).all(),
     ).item()
+
+
+# ===========================================================================
+# Action column
+# ===========================================================================
+
+VALID_ACTIONS = {
+    "Show",
+    "Flag",
+    "Suppress",
+}
+
+
+@pytest.mark.parametrize(
+    ("events", "n", "expected"),
+    [
+        # one case per row of the approved rules table (CP01-CP14)
+        (0, 0, "Suppress"),  # CP01 empty group
+        (20, 100, "Show"),  # CP02 clean
+        (0, 100, "Flag"),  # CP03 zero events, large n
+        (5, 100, "Flag"),  # CP04 few events, large n
+        (100, 100, "Flag"),  # CP05 all events, large n
+        (95, 100, "Flag"),  # CP06 few non-events, large n
+        (15, 30, "Flag"),  # CP07 small n only
+        (0, 20, "Suppress"),  # CP08 small n, zero events
+        (5, 30, "Suppress"),  # CP09 small n, few events
+        (20, 20, "Suppress"),  # CP10 small n, all events
+        (25, 30, "Suppress"),  # CP11 small n, few non-events
+        (0, 5, "Suppress"),  # CP12 tiny n, zero events
+        (5, 5, "Suppress"),  # CP13 tiny n, all events
+        (4, 9, "Suppress"),  # CP14 tiny n, both counts low
+        # boundaries
+        (5, 40, "Flag"),  # n = 40 counts as an adequate sample
+        (20, 40, "Show"),
+        (10, 39, "Flag"),  # events = 10 is not low
+        (9, 39, "Suppress"),
+    ],
+)
+def test_crude_proportion_action_rules(
+    events: float,
+    n: float,
+    expected: str,
+) -> None:
+    """Crude proportion actions follow the approved rules table."""
+    assert _crude_proportion_action(events, n) == expected
+
+
+@pytest.mark.parametrize(
+    ("events", "denominator", "expected"),
+    [
+        # one case per row of the approved rules table (CR01-CR07)
+        (0, 0, "Suppress"),  # CR01 zero denominator
+        (20, 1000, "Show"),  # CR02 clean
+        (0, 1000, "Flag"),  # CR03 zero events, large denominator
+        (5, 1000, "Flag"),  # CR04 few events, large denominator
+        (12, 30, "Flag"),  # CR05 small denominator only
+        (0, 30, "Suppress"),  # CR06 small denominator, zero events
+        (5, 30, "Suppress"),  # CR07 small denominator, few events
+        # boundaries
+        (10, 40, "Show"),
+        (9, 40, "Flag"),
+        (10, 39, "Flag"),
+        (9, 39, "Suppress"),
+    ],
+)
+def test_crude_rate_action_rules(
+    events: float,
+    denominator: float,
+    expected: str,
+) -> None:
+    """Crude rate actions follow the approved rules table."""
+    assert _crude_rate_action(events, denominator) == expected
+
+
+@pytest.mark.parametrize(
+    ("events", "n", "missing_strata_count", "stratum_ns", "coverage", "expected"),
+    [
+        (30, 100, 0, [50, 50], 1.0, "Show"),  # no warnings
+        (5, 100, 0, [50, 50], 1.0, "Flag"),  # low events only
+        (95, 100, 0, [50, 50], 1.0, "Flag"),  # low non-events only
+        (15, 30, 0, [15, 15], 1.0, "Flag"),  # n < 40 only
+        (30, 100, 1, [0, 100], 0.95, "Flag"),  # missing strata only
+        (30, 100, 0, [95, 5], 1.0, "Flag"),  # one small stratum only
+        (5, 30, 0, [15, 15], 1.0, "Suppress"),  # n < 40 and low events
+        (30, 100, 1, [0, 95, 5], 0.95, "Suppress"),  # missing + small stratum
+        (30, 100, 1, [0, 100], 0.80, "Suppress"),  # coverage < 90%
+        (12, 19, 0, [10, 9], 1.0, "Suppress"),  # n < 20
+        (0, 0, 0, [], 1.0, "Suppress"),  # empty group
+        # boundaries
+        (30, 100, 1, [0, 100], 0.90, "Flag"),  # coverage of exactly 90% is allowed
+        (10, 20, 0, [10, 10], 1.0, "Flag"),  # n = 20 is not < 20, so only the n < 40 warning
+        (10, 40, 0, [20, 20], 1.0, "Show"),  # n = 40 and counts of 10 are not low
+    ],
+)
+def test_ds_proportion_action_rules(
+    events: float,
+    n: float,
+    missing_strata_count: int,
+    stratum_ns: list[float],
+    coverage: float,
+    expected: str,
+) -> None:
+    """DSP actions: hard suppression first, then count the warnings."""
+    action = _ds_proportion_action(
+        events=events,
+        n=n,
+        missing_strata_count=missing_strata_count,
+        raw_stratum_ns=stratum_ns,
+        observed_reference_weight=coverage,
+    )
+
+    assert action == expected
+
+
+@pytest.mark.parametrize(
+    ("events", "denominator", "missing_strata_count", "stratum_denominators", "coverage", "expected"),
+    [
+        (50, 1000, 0, [500, 500], 1.0, "Show"),  # no warnings
+        (5, 1000, 0, [500, 500], 1.0, "Flag"),  # low events only
+        (50, 30, 0, [15, 15], 1.0, "Flag"),  # denominator < 40 only
+        (50, 1000, 1, [0, 1000], 0.80, "Flag"),  # missing strata only (low coverage alone does not suppress)
+        (50, 1000, 0, [995, 5], 1.0, "Flag"),  # one small stratum only
+        (5, 30, 0, [15, 15], 1.0, "Suppress"),  # low events and denominator < 40
+        (50, 1000, 1, [0, 995, 5], 0.95, "Suppress"),  # missing + small stratum
+        (50, 15, 1, [0, 15], 0.80, "Suppress"),  # denominator < 20 and coverage < 90%
+        (50, 15, 0, [15], 1.0, "Flag"),  # denominator < 20 on its own is one warning
+        # boundaries
+        (10, 40, 0, [20, 20], 1.0, "Show"),
+        (9, 40, 0, [20, 20], 1.0, "Flag"),
+    ],
+)
+def test_ds_rate_action_rules(
+    events: float,
+    denominator: float,
+    missing_strata_count: int,
+    stratum_denominators: list[float],
+    coverage: float,
+    expected: str,
+) -> None:
+    """DSR actions: hard suppression first, then count the warnings."""
+    action = _ds_rate_action(
+        events=events,
+        denominator=denominator,
+        missing_strata_count=missing_strata_count,
+        raw_stratum_denominators=stratum_denominators,
+        observed_reference_weight=coverage,
+    )
+
+    assert action == expected
+
+
+@pytest.mark.parametrize(
+    ("events", "expected"),
+    [
+        ([1] * 20 + [0] * 80, "Show"),  # 20 / 100
+        ([1] * 5 + [0] * 95, "Flag"),  # 5 / 100
+        ([1] * 2 + [0] * 2, "Suppress"),  # 2 / 4
+    ],
+)
+def test_crude_proportion_df_returns_action(
+    events: list[int],
+    expected: str,
+) -> None:
+    """The public crude proportion function fills the action column."""
+    result = crude_proportion_df(
+        pl.DataFrame({"event": events}),
+        event_col="event",
+    )
+
+    assert result.row(0, named=True)["action"] == expected
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        ([1] * 50, "Show"),  # 50 events / 50 rows
+        ([1] * 5 + [0] * 95, "Flag"),  # 5 events / 100 rows
+        ([1, 0, 2], "Suppress"),  # 3 events / 3 rows
+    ],
+)
+def test_crude_rate_df_returns_action(
+    counts: list[int],
+    expected: str,
+) -> None:
+    """The public crude rate function fills the action column."""
+    result = crude_rate_df(
+        pl.DataFrame({"count": counts}),
+        event_col="count",
+    )
+
+    assert result.row(0, named=True)["action"] == expected
+
+
+@pytest.mark.parametrize(
+    ("events", "expected"),
+    [
+        # stratum A: 50 rows, stratum B: 50 rows, 40 events -> no warnings
+        ([1] * 20 + [0] * 30 + [1] * 20 + [0] * 30, "Show"),
+        # 100 rows but only 5 events -> one warning
+        ([1] * 5 + [0] * 45 + [0] * 50, "Flag"),
+    ],
+)
+def test_dsp_df_returns_action(
+    events: list[int],
+    expected: str,
+) -> None:
+    """The public DSP function fills the action column."""
+    df = pl.DataFrame(
+        {
+            "event": events,
+            "age_band": ["A"] * 50 + ["B"] * 50,
+        },
+    )
+
+    result = directly_standardized_proportion_df(
+        df,
+        event_col="event",
+        strata_cols=["age_band"],
+    )
+
+    assert result.row(0, named=True)["action"] == expected
+
+
+def test_dsp_df_suppresses_small_missing_strata_group(
+    missing_strata_df: pl.DataFrame,
+) -> None:
+    """A tiny group with 67% coverage is suppressed."""
+    result = directly_standardized_proportion_df(
+        missing_strata_df,
+        event_col="event",
+        strata_cols=["age_band"],
+        inequalities_cols=["group"],
+    )
+
+    assert get_row(result, group="G1")["action"] == "Suppress"
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        # 100 rows, 100 events -> no warnings
+        ([1] * 100, "Show"),
+        # 100 rows but only 5 events -> one warning
+        ([1] * 5 + [0] * 95, "Flag"),
+    ],
+)
+def test_dsr_df_returns_action(
+    counts: list[int],
+    expected: str,
+) -> None:
+    """The public DSR function fills the action column."""
+    df = pl.DataFrame(
+        {
+            "count": counts,
+            "age_band": ["A"] * 50 + ["B"] * 50,
+        },
+    )
+
+    result = directly_standardized_rate_df(
+        df,
+        event_col="count",
+        strata_cols=["age_band"],
+    )
+
+    assert result.row(0, named=True)["action"] == expected
+
+
+def test_dsr_df_suppresses_small_missing_strata_group(
+    missing_strata_df: pl.DataFrame,
+) -> None:
+    """A tiny group with 67% coverage is suppressed."""
+    result = directly_standardized_rate_df(
+        missing_strata_df,
+        event_col="count",
+        strata_cols=["age_band"],
+        inequalities_cols=["group"],
+    )
+
+    assert get_row(result, group="G1")["action"] == "Suppress"
+
+
+@pytest.mark.parametrize(
+    ("function", "event_col", "extra_kwargs"),
+    [
+        (crude_proportion_df, "event", {}),
+        (crude_rate_df, "count", {}),
+        (directly_standardized_proportion_df, "event", {"strata_cols": ["age_band"]}),
+        (directly_standardized_rate_df, "count", {"strata_cols": ["age_band"]}),
+    ],
+)
+def test_all_functions_return_valid_actions(
+    analytical_df: pl.DataFrame,
+    function: Callable[..., pl.DataFrame],
+    event_col: str,
+    extra_kwargs: dict[str, object],
+) -> None:
+    """Every row of every function has an action of Show, Flag or Suppress."""
+    result = function(
+        analytical_df,
+        event_col=event_col,
+        inequalities_cols=["sex"],
+        **extra_kwargs,
+    )
+
+    assert set(result["action"].to_list()) <= VALID_ACTIONS
